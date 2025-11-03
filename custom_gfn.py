@@ -141,14 +141,43 @@ class ObjectStates(States):
         cls._source_state_tuple = source_tuple
 
     def __init__(self, states_list: List[Any], device: torch.device = None):
+        # ---
+        # --- THIS IS THE FIX (Part 1) ---
+        # This robust __init__ handles all cases:
+        # 1. The correct case (a list of tuples)
+        # 2. The `sf` case (a list with one int, e.g., [-1])
+        # 3. The BUGGY base.copy() case (a torch.Tensor)
+        # ---
+        if isinstance(states_list, torch.Tensor):
+            # This happens if base `States.copy()` is called.
+            # It passes `self.tensor.clone()`, which is `[0, 1, 2, ...]`.
+            # We convert it to a Python list.
+            processed_states_list = states_list.tolist()
+        elif not isinstance(states_list, list):
+            # This handles the `sf` case where `states_list` is `[-1]`.
+            try:
+                processed_states_list = list(states_list)
+            except TypeError:
+                # `list(-1)` fails, so we catch it.
+                processed_states_list = [states_list]
+        else:
+            # This is the "correct" path (e.g., from env.step or make_initial_states)
+            processed_states_list = states_list
+        # ---
+
         super(States, self).__init__()
 
         # --- DEVICE FIX ---
         # Use the provided device, or default to CPU.
         # This ensures self.tensor (and self.device) are correct.
         self._device = device if device is not None else torch.device("cpu")
-        self.states_list = states_list
-        self.tensor = torch.arange(len(states_list), dtype=torch.long, device=self._device)
+
+        # ---
+        # --- THIS IS THE FIX (Part 2) ---
+        # Use the *processed* list, not the original `states_list`.
+        self.states_list = processed_states_list
+        # ---
+        self.tensor = torch.arange(len(self.states_list), dtype=torch.long, device=self._device)
         # ---
 
         self.shape = self.tensor.shape
@@ -161,7 +190,12 @@ class ObjectStates(States):
         # then checks if it has a shape, all without erroring.
         s0_shape = getattr(getattr(self.__class__, "s0", None), "shape", "N/A")
         # ---
-        print(f"[DEBUG] ObjectStates.__init__: Created batch. self.shape={self.shape}, self.s0.shape={s0_shape}, first state={states_list[0]}")
+        # --- THIS IS THE FIX (Part 3) ---
+        # Use self.states_list[0] for the debug print, which is now safe.
+        first_state_debug = self.states_list[0] if self.states_list else "N/A"
+        # This print statement will now show `first state=0` when the bug occurs
+        # if the copy() method is not overridden.
+        print(f"[DEBUG] ObjectStates.__init__: Created batch. self.shape={self.shape}, self.s0.shape={s0_shape}, first state={first_state_debug}")
         # -----------
 
         if hasattr(self, "s0") and self.s0 is not None:
@@ -178,6 +212,31 @@ class ObjectStates(States):
             print(f"[DEBUG] ObjectStates.__init__: self.s0 is not set yet (this is OK if creating s0).")
             # -----------
             pass
+
+    # ---
+    # --- THIS IS THE CRITICAL FIX (Part 4) ---
+    #
+    def copy(self) -> "ObjectStates":
+        """
+        Overrides the base 'States.copy()' method.
+        The base method copies 'self.tensor', which is wrong for ObjectStates.
+        We must copy 'self.states_list'.
+        """
+        # --- DEBUG ---
+        # print(f"[DEBUG] ObjectStates.copy: Copying states_list (len={len(self.states_list)})")
+        # ---
+        # Perform a shallow copy of the list of tuples.
+        # This is safe because the tuples themselves are immutable.
+        new_states_list = list(self.states_list)
+
+        # Return a *new* instance using our *correct* __init__.
+        # This will call __init__ with a valid list of tuples,
+        # and the "first state=0" log will NOT appear.
+        return self.__class__(new_states_list, device=self.device)
+    # ---
+    # --- END OF CRITICAL FIX ---
+    # ---
+
 
     # ---
     # --- THE FIX for the IndexError ---
@@ -222,6 +281,47 @@ class ObjectStates(States):
         # ---
     # ---
     # --- END OF FIX ---
+    # ---
+
+    # ---
+    # --- THIS IS THE CRITICAL FIX (Part 5) ---
+    #
+    def __setitem__(self, index: Any, value: "ObjectStates"):
+        """
+        Handles setting a slice of the states.
+        This is required by 'env._step' (e.g., new_states[not_dones] = ...).
+        """
+        # --- DEBUG ---
+        # print(f"[DEBUG] ObjectStates.__setitem__: Setting items. Index type: {type(index)}")
+        # ---
+
+        if not isinstance(value, ObjectStates):
+            # This shouldn't happen if env.step returns ObjectStates
+            raise TypeError(f"Value must be an ObjectStates object, not {type(value)}")
+
+        new_states_to_set = value.states_list
+
+        if isinstance(index, torch.Tensor) and index.dtype == torch.bool:
+            # This is the expected case: new_states[not_dones]
+            index_list = index.cpu().numpy()
+            value_iter = iter(new_states_to_set)
+            for i in range(len(index_list)):
+                if index_list[i]:
+                    try:
+                        # This correctly modifies the `self.states_list`
+                        self.states_list[i] = next(value_iter)
+                    except StopIteration:
+                        raise IndexError("Not enough values to set in ObjectStates __setitem__")
+        else:
+            # Handle other index types if necessary
+            # This is a basic implementation for other index types
+            try:
+                self.states_list[index] = new_states_to_set
+            except Exception as e:
+                raise TypeError(f"ObjectStates __setitem__ encountered an error. Index: {index}, Value: {value}. Error: {e}")
+
+    # ---
+    # --- END OF CRITICAL FIX ---
     # ---
 
     # ---
@@ -610,8 +710,12 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
                 print(f"Error: {e}")
                 print(f"Failing state (i={i}): {state}")
                 # --- DEBUG ---
-                # Add print statements for variables that might not be defined
-                # if the error happens early in the try block
+                # This error (`cannot unpack non-iterable int object`)
+                # would happen *here* if `raw_states` was `[0, 1, 2, ...]`.
+                # But the traceback says the error is in `env.step`.
+                # This confirms the `states` object *passed to get_logits*
+                # is correct, but the one *passed to env.step* is not.
+                # ---
                 print(f"State: {state}")
                 if 'num_factors' in locals():
                     print(f"num_factors: {num_factors}, factor_idx: {factor_idx}")
