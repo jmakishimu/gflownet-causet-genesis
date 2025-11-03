@@ -67,6 +67,12 @@ class CausalSetEnv(FactorEnv):
 
         self._graph_cache = {}
 
+        # --- FIX: CRITICAL - Patch ObjectStates with environment config ---
+        # This allows ObjectStates.is_sink_state to correctly identify terminal states
+        ObjectStates.patch_env_config(env_max_nodes=self.max_nodes, sf_value=self.eos_action)
+        print(f"[DEBUG] CausalSetEnv: Patched ObjectStates with max_nodes={self.max_nodes}, eos_action={self.eos_action}")
+        # ---
+
     def get_action_space(self, state):
         return self.action_space
 
@@ -130,11 +136,8 @@ class CausalSetEnv(FactorEnv):
 
             new_state = (new_n, new_edges, ())
 
-            print(f"[DEBUG] STAGE TRANSITION: new_n={new_n}, self.max_nodes={self.max_nodes}")
-
             if new_n == self.max_nodes:
                 is_done = True
-                print(f"[DEBUG] STOP CONDITION MET. Setting is_done = True.")
 
             self._graph_cache = {}
             action_taken = self.eos_action

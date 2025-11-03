@@ -847,15 +847,18 @@ class CustomActions(Actions):
     """
     @property
     def batch_shape(self) -> torch.Size:
-        # The tensor shape is [batch_size, action_dim] where action_dim = 1
-        # We want batch_shape to be [batch_size, 1] (2D)
-        # The base class returns self.tensor.shape[:-1] which gives [batch_size] (1D)
-        # We need to keep the full 2D shape for the first two dimensions
+        """
+        Returns the batch shape for actions.
+        The tensor shape is [batch_size, action_dim] where action_dim = 1.
+        We need to return just [batch_size] to match what Trajectories expects.
+        """
+        # The base Actions class expects batch_shape to exclude the action dimensions
+        # For a tensor of shape [B, 1], batch_shape should be [B]
         if len(self.tensor.shape) >= 2:
-            return self.tensor.shape[:2]  # Return [batch_size, 1] or [batch_size, seq_len]
+            return self.tensor.shape[:1]  # Return just [batch_size]
         else:
-            # Fallback: make it 2D
-            return torch.Size([self.tensor.shape[0], 1])
+            # Fallback for 1D tensor
+            return self.tensor.shape
 # ---
 # --- END OF FIX ---
 # ---
