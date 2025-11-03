@@ -9,6 +9,9 @@ from typing import List, Any
 # Import the base 'States' (for type hints) and our new 'ObjectStates'
 from gfn.states import States
 from custom_gfn import FactorEnv, ObjectStates
+# --- FIX for 'Actions' AttributeError & ImportError ---
+# Import the base 'Actions' class from gfn.actions
+from gfn.actions import Actions
 # -----------
 
 # The state is a tuple: (n, edges, partial_v)
@@ -31,9 +34,9 @@ class CausalSetEnv(FactorEnv):
         self.max_nodes = max_nodes
         self.proxy = proxy
 
-        # --- FIX ---
-        # Renamed 'self.device' to 'self._device' to avoid attribute
-        # collision with the 'device' property in the base 'gfn.env.Env'.
+        # --- FIX for 'AttributeError: can't set attribute 'device'' ---
+        # The base 'Env' class defines 'device' as a property.
+        # We must set the internal attribute 'self._device' to avoid collision.
         self._device = torch.device(device)
         # -----------
 
@@ -48,6 +51,37 @@ class CausalSetEnv(FactorEnv):
 
         self.action_space = [0, 1] # Binary decisions
         self.eos_action = -1
+
+        # --- FIX for 'Actions' AttributeError ---
+        # We must manually set the attributes that gfn.Env.__init__
+        # would normally set for the sampler to work.
+        # We use the base 'Actions' class.
+        self.Actions = Actions
+
+        # n_actions = len(self.action_space). The sampler/policy
+        # deals with [0, 1]. The eos_action (-1) is handled by
+        # our custom agent and env.step() logic.
+        self.n_actions = len(self.action_space)
+        self.policy_output_dim = self.n_actions
+
+        # --- FIX for 'action_shape' AttributeError ---
+        # We must MANUALLY set the required class attributes
+        # on the 'Actions' class we've assigned to this env.
+        # The docs state action_shape is (1,) for discrete envs.
+        self.Actions.action_shape = (1,)
+
+        # --- FIX for 'torch.Size([])' error ---
+        # The sampler requires dummy and exit actions to have a shape
+        # matching 'action_shape'. We wrap in a list to make shape [1].
+        self.Actions.dummy_action = torch.tensor([self.eos_action], device=self._device)
+        self.Actions.exit_action = torch.tensor([self.eos_action], device=self._device)
+        # ---
+
+        # --- FIX for 'check_action_validity' AttributeError ---
+        # The sampler checks this flag. Since our agent handles masking,
+        # we can disable the env's check.
+        self.check_action_validity = False
+        # ---
 
         # 2. Define the source state as a raw tuple.
         source_tuple = (0, (), ())
@@ -84,7 +118,10 @@ class CausalSetEnv(FactorEnv):
         # --- DEBUG ---
         print(f"[DEBUG] CausalSetEnv.__init__: Creating self.s0...")
         # -----------
-        self.s0 = self.States([source_tuple])
+        # --- DEVICE FIX ---
+        # Pass the correct device to the States constructor.
+        self.s0 = self.States([source_tuple], device=self._device)
+        # ---
         # --- DEBUG ---
         print(f"[DEBUG] CausalSetEnv.__init__: self.s0 created. shape={self.s0.shape}")
         # -----------
@@ -105,9 +142,19 @@ class CausalSetEnv(FactorEnv):
         # --- DEBUG ---
         print(f"[DEBUG] CausalSetEnv.__init__: Creating self.sf...")
         # -----------
-        self.sf = self.States([self.eos_action])
+        # --- DEVICE FIX ---
+        # Pass the correct device to the States constructor.
+        self.sf = self.States([self.eos_action], device=self._device)
+        # ---
         # --- DEBUG ---
         print(f"[DEBUG] CausalSetEnv.__init__: self.sf created. shape={self.sf.shape}")
+
+        # --- FIX for 'is_sink_state' CRITICAL ERROR ---
+        # We must set the CLASS attribute for sf, just like we did for s0.
+        self.States.sf = self.sf
+        print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.sf = self.sf")
+        # ---
+
         print(f"[DEBUG] CausalSetEnv.__init__: Environment initialization complete.")
         # -----------
 
@@ -163,76 +210,73 @@ class CausalSetEnv(FactorEnv):
             if g.has_edge(j, i) and v_j == 0:
                 return self.mask_force_0
 
-            # Rule 2: (i < j) AND (NOT j < n) => (NOT i < n)
-            # (This was the (correct) 'Force 0' rule from the original file)
-            # If we set v_i=1 (i < n), we'd have i < j and NOT j < n.
-            # This violates transitivity.
-            # We must force v_i=0.
-            if g.has_edge(i, j) and v_j == 0:
-                return self.mask_force_0
-
-            # --- Check FORCE 1 condition ---
-
-            # Rule 3: (i < j) AND (j < n) => (i < n)
-            # (This replaces the incorrect 'Force 1' rule)
-            # If we set v_i=0 (NOT i < n), we'd have i < j and j < n.
-            # This violates transitivity.
-            # We must force v_i=1.
-            if g.has_edge(i, j) and v_j == 1:
-                return self.mask_force_1
-
         # No transitivity constraints found, both actions are valid
         return self.mask_valid
 
-    def step(self, state, action):
+    # ---
+    # --- THIS IS THE FIX ---
+    #
+    def step(self, states: ObjectStates, actions: Actions) -> ObjectStates:
         """
-        Apply a single factor action and update the state.
-
-        Returns: (next_state, action_taken, is_done)
+        Apply a batch of actions to a batch of states.
+        This overrides the base Env.step method.
         """
-        n, edges, partial_v = state
-        factor_idx = len(partial_v)
+        new_states_list = []
 
-        # Add the new action to the partial vector
-        new_partial_v = partial_v + (action,)
+        # We must iterate over the raw Python states and actions
+        # actions.tensor is shape [batch_size, 1], so we .squeeze() or [:, 0]
+        raw_actions = actions.tensor[:, 0]
 
-        num_factors = self.get_num_factors(state)
-        is_done = False # Default: not done
+        for i in range(len(states.states_list)):
+            state = states.states_list[i]
+            action = raw_actions[i].item() # Get the Python int for the action
 
-        if len(new_partial_v) < num_factors:
-            # Stage is not complete, stay in the same stage
-            new_state = (n, edges, new_partial_v)
-            # is_done remains False
-        else:
-            # Stage is complete, add the new node and edges
-            new_n = n + 1
-            new_node = n
+            # ---
+            # This is your original, single-state step logic
+            # ---
+            n, edges, partial_v = state
+            factor_idx = len(partial_v)
+            num_factors = self.get_num_factors(state)
+            is_done = False
 
-            # Build new edge list
-            new_edges_list = list(edges)
-            for i, v_i in enumerate(new_partial_v):
-                if v_i == 1:
-                    new_edges_list.append((i, new_node))
+            if factor_idx == num_factors:
+                # Stage is complete. 'action' is the 0 forced by the agent.
+                new_n = n + 1
+                new_node = n
 
-            new_edges = tuple(new_edges_list)
+                new_edges_list = list(edges)
+                for j, v_j in enumerate(partial_v): # Use the state's partial_v
+                    if v_j == 1:
+                        new_edges_list.append((j, new_node))
+                new_edges = tuple(new_edges_list)
 
-            # Move to the next stage, reset partial_v
-            new_state = (new_n, new_edges, ())
+                new_state = (new_n, new_edges, ())
 
-            # --- FIX ---
-            # Corrected typo: self.max_models -> self.max_nodes
-            if new_n == self.max_nodes:
-            # -----------
-                is_done = True
-            # else: is_done remains False
+                if new_n == self.max_nodes:
+                    is_done = True
 
-            # (Reviewer 2 Fix) Clear cache
-            self._graph_cache = {}
+                self._graph_cache = {}
 
-        # --- FIX ---
-        # Return (next_state, action_taken, is_done)
-        return new_state, action, is_done
-        # -----------
+                # In a batched step, we don't return 'eos_action' or 'done'.
+                # The sampler handles 'done' separately via 'is_sink_state'.
+                # We just return the new state.
+                new_states_list.append(new_state)
+
+            else:
+                # This is a FACTOR DECISION step.
+                # 'action' is the factor decision (0 or 1).
+                new_partial_v = partial_v + (action,)
+                new_state = (n, edges, new_partial_v)
+                new_states_list.append(new_state)
+            # ---
+            # End of original single-state logic
+            # ---
+
+        # Return a new batch of ObjectStates
+        return self.States(new_states_list, device=self._device)
+    # ---
+    # --- END OF FIX ---
+    # ---
 
     def get_log_reward(self, final_states: States) -> torch.Tensor:
         """
@@ -243,7 +287,9 @@ class CausalSetEnv(FactorEnv):
 
         # --- FIX ---
         # Extract raw tuples from the States object, similar to FactorPreAggAgent
+        # --- SYNTAX ERROR FIX: Added missing colon ---
         try:
+        # ---
             # --- DEBUG ---
             # Use .states_list, which is the correct attribute
             raw_states: List[tuple] = final_states.states_list
@@ -277,7 +323,7 @@ class CausalSetEnv(FactorEnv):
                 rewards.append(self.proxy.get_energy(g))
 
         # --- FIX ---
-        # Return a tensor on the correct device
+        # Return a tensor on the correct device (use self._device)
         return torch.tensor(rewards, device=self._device, dtype=torch.float)
         # -----------
 

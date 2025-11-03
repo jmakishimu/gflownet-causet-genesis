@@ -191,8 +191,10 @@ def main():
             # We must pass args.batch_size here, not args.N,
             # to ensure we sample the correct number of trajectories.
             #
+            # --- BUG #2 FIX: Corrected keyword argument ---
+            # The API uses 'n', not 'n_samples'.
             trajectories = gflownet.sample_trajectories(
-                env, n_samples=args.batch_size, n=args.batch_size
+                env, n=args.batch_size
             )
             # -----------
 
@@ -274,8 +276,9 @@ def main():
             # ---
             # --- THE FIX ---
             # Using args.batch_size for 'n' here as well.
+            # --- BUG #2 FIX: Corrected keyword argument ---
             trajectories = gflownet.sample_trajectories(
-                env, n_samples=args.batch_size, n=args.batch_size
+                env, n=args.batch_size
             )
             # -----------
             # --- DEBUG ---

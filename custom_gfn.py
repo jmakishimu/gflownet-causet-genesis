@@ -13,6 +13,10 @@ from torch_geometric.data import Batch
 from abc import ABC, abstractmethod
 from typing import Callable, List, Any
 import time  # --- DEBUG ---
+# --- FIX ---
+# Import the distribution module for the new method
+import torch.distributions as dist
+# -----------
 
 # Import from the provided library files
 from gfn.env import Env
@@ -138,9 +142,15 @@ class ObjectStates(States):
 
     def __init__(self, states_list: List[Any], device: torch.device = None):
         super(States, self).__init__()
-        cpu_device = torch.device("cpu")
+
+        # --- DEVICE FIX ---
+        # Use the provided device, or default to CPU.
+        # This ensures self.tensor (and self.device) are correct.
+        self._device = device if device is not None else torch.device("cpu")
         self.states_list = states_list
-        self.tensor = torch.arange(len(states_list), dtype=torch.long, device=cpu_device)
+        self.tensor = torch.arange(len(states_list), dtype=torch.long, device=self._device)
+        # ---
+
         self.shape = self.tensor.shape
 
         # --- DEBUG ---
@@ -184,6 +194,77 @@ class ObjectStates(States):
     # ---
     # ---
 
+    # ---
+    # --- FIX for 'is_sink_state' NotImplementedError ---
+    #
+    @property
+    def is_sink_state(self) -> torch.Tensor:
+        """
+        Checks which states in the batch are the sink state.
+        This property is required by the GFN sampler.
+        """
+        try:
+            # Get the canonical sink state value (e.g., -1)
+            # This was set in CausalSetEnv.__init__
+            sink_val = self.__class__.sf.states_list[0]
+        except Exception as e:
+             # Fallback in case sf is not set, though it should be.
+             print(f"[DEBUG] ObjectStates.is_sink_state: CRITICAL WARNING: self.__class__.sf not found or not set. Error: {e}. Falling back to -1.")
+             sink_val = -1
+
+        # Compare each state in the batch to the sink value
+        is_sink = [s == sink_val for s in self.states_list]
+
+        # --- DEVICE FIX ---
+        # Return as a boolean tensor on the correct device.
+        # self.tensor.device is now the correct device (e.g., cuda:0)
+        return torch.tensor(is_sink, dtype=torch.bool, device=self.tensor.device)
+        # ---
+    # ---
+    # --- END OF FIX ---
+    # ---
+
+    # ---
+    # --- THIS IS THE FIX ---
+    #
+    def __getitem__(self, index: Any) -> Any:
+        """
+        Handles slicing and indexing of the ObjectStates batch.
+        This is required by the sampler to filter active states (with a bool tensor)
+        and to iterate (with an int).
+        """
+
+        if isinstance(index, int):
+            # Handle single item access (e.g., states[0])
+            # This is called by the base Env.step() when iterating.
+            return self.states_list[index] # Returns the raw tuple
+
+        if isinstance(index, torch.Tensor):
+            if index.dtype == torch.bool:
+                # Handle boolean mask (e.g., states[~dones])
+                index_list = index.cpu().numpy()
+            else:
+                # Handle integer tensor slicing (e.g., states[torch.tensor([0, 2])])
+                filtered_states = [self.states_list[i] for i in index.cpu().numpy()]
+                return self.__class__(filtered_states, device=self.device)
+        elif isinstance(index, slice):
+            # Handle slice access (e.g., states[1:3])
+            return self.__class__(self.states_list[index], device=self.device)
+        else:
+            # Assume boolean list/numpy array
+            index_list = index
+
+        # Handle boolean list/array filtering (e.g., states[~dones])
+        filtered_states = [
+            state for i, state in enumerate(self.states_list) if index_list[i]
+        ]
+
+        # Return a *new* ObjectStates object with the filtered list.
+        return self.__class__(filtered_states, device=self.device)
+    # ---
+    # --- END OF FIX ---
+    # ---
+
     @classmethod
     def make_initial_states(cls, batch_shape: tuple[int, ...],
                             device: torch.device = None) -> 'ObjectStates':
@@ -203,6 +284,7 @@ class ObjectStates(States):
         initial_states_list = [cls._source_state_tuple] * num_states
 
         # Return a new instance of ObjectStates wrapping this list
+        # This device is passed from the sampler (e.g., cuda:0)
         return cls(initial_states_list, device=device)
 # --- END NEW CLASS ---
 # ---
@@ -280,6 +362,26 @@ class FactorPreAggPolicy(nn.Module):
         factor_logits = self.mlp(node_embeddings)
 
         return factor_logits
+
+# ---
+# --- FIX for 'AssertionError' (shape mismatch) ---
+#
+class _CategoricalWrapper(dist.Categorical):
+    """
+    A wrapper for the Categorical distribution to fix a shape mismatch.
+    The default 'dist.sample()' returns [batch_size], but the 'gfn.Actions'
+    class expects [batch_size, 1]. This wrapper fixes that.
+    """
+    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        # Call the original sample method
+        actions_tensor = super().sample(sample_shape)
+
+        # Add the missing dimension: [batch_size] -> [batch_size, 1]
+        return actions_tensor.unsqueeze(-1)
+
+# ---
+# --- END OF FIX ---
+# ---
 
 # ---
 # Theory and Justification for FactorPreAggAgent
@@ -408,14 +510,15 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
             )
 
         # 1. Extract raw state tuples from the States container.
+        #    Because we implemented __getitem__ in ObjectStates, 'states'
+        #    will always be an ObjectStates object, so states.states_list
+        #    will always exist.
         try:
-            # --- DEBUG ---
-            # Changed 'states.tensor.flat' to 'states.states_list'
-            # This is the correct way to get states from our ObjectStates
             raw_states: List[tuple] = states.states_list
-            # ---
         except AttributeError:
-            # Fallback for other States objects
+            # This block should no longer be reached, but is kept
+            # as a fallback.
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: WARNING! states object is not ObjectStates. Falling back.")
             try:
                 raw_states: List[tuple] = list(states.tensor.flat)
             except AttributeError:
@@ -536,3 +639,35 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
         implement 'forward' to be safe.
         """
         return self.get_logits(states, backward)
+
+    # ---
+    # --- FIX for 'AttributeError' (logits.dim()) ---
+    #
+    def to_probability_distribution(self, states: States, context: torch.Tensor) -> dist.Distribution:
+        """
+        Overrides the 'PolicyMixin' method to correctly create the distribution.
+
+        Args:
+            states: The 'ObjectStates' object (which we ignore here).
+            context: The logits tensor (e.g., shape [128, 2]) returned
+                     by 'self.init_context', which itself just returns
+                     the 'estimator_outputs' from 'self.forward()'.
+
+        Returns:
+            A _CategoricalWrapper object.
+        """
+        # The 'context' is the logits tensor returned by our 'get_logits'
+        # method, via the compute_dist -> self.forward -> init_context pipeline.
+        logits = context
+
+        # --- DEBUG ---
+        # This fixes the user's debug log to show the correct shape.
+        if self.get_logits_call_count <= 5: # Match debug frequency
+             print(f"[DEBUG] FactorPreAggAgent.to_probability_distribution: Converting logits of shape {logits.shape} to Categorical.")
+        # ---
+
+        # Return our wrapper instead of the base dist.Categorical
+        return _CategoricalWrapper(logits=logits)
+    # ---
+    # --- END OF FIX ---
+    # ---

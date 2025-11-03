@@ -91,35 +91,54 @@ class CausalSetRewardProxy:
         if n < 2:
             return 0.0
 
-        tc = nx.transitive_closure(g, reflexive=True)
+        # --- MMD BUG FIX ---
+        # We need *both* closures.
+        # Inclusive: To check if x and y are related at all.
+        # Exclusive: To find the set of nodes *between* x and y.
+        tc_inclusive = nx.transitive_closure(g, reflexive=True)
+        tc_exclusive = nx.transitive_closure(g, reflexive=False)
+        # ---
         ratios = []
 
         for _ in range(num_samples):
             x, y = random.sample(nodes, 2)
 
-            if tc.has_edge(y, x): x, y = y, x # Ensure x < y
-            elif not tc.has_edge(x, y): continue # Spacelike
+            if tc_inclusive.has_edge(y, x): x, y = y, x # Ensure x < y
+            elif not tc_inclusive.has_edge(x, y): continue # Spacelike
 
-            # Vectorized interval check
-            interval_nodes = {z for z in nodes if tc.has_edge(x, z) and tc.has_edge(z, y)}
+            # --- MMD BUG FIX ---
+            # Vectorized interval check (EXCLUSIVE)
+            # z must be a SUCCESSOR of x (x < z)
+            # z must be a PREDECESSOR of y (z < y)
+            interval_nodes = {
+                z for z in nodes
+                if tc_exclusive.has_edge(x, z) and tc_exclusive.has_edge(z, y)
+            }
+            # ---
             C_1 = len(interval_nodes)
 
-            if C_1 < 2: continue # Not a valid interval, skip sample (C_1 is inclusive, so C_1 >= 2)
+            # --- MMD BUG FIX ---
+            # The original 'C_1 < 2' was for an *inclusive* interval.
+            # For an *exclusive* interval, C_1=0 and C_1=1 are both invalid
+            # for forming a C_2 ratio.
+            if C_1 < 2: continue # Not a valid interval, skip sample
+            # ---
 
             C_2 = 0
             interval_list = list(interval_nodes)
             for i in range(C_1):
                 for j in range(i + 1, C_1):
                     u, v = interval_list[i], interval_list[j]
-                    if tc.has_edge(u, v) or tc.has_edge(v, u):
+                    # Use *inclusive* TC here to check if u and v are related
+                    if tc_inclusive.has_edge(u, v) or tc_inclusive.has_edge(v, u):
                         C_2 += 1
 
             # Add the ratio, *including* C_2 = 0 cases
             ratios.append(C_2 / (C_1**2))
 
-        # (THE FIX) If 'ratios' is empty (e.g., a 1D chain where
-        # C1>=2 but C2=0 always, or just no C1>=2 intervals found),
-        # return 0.0, not the target_ratio.
+        # (THE FIX) If 'ratios' is empty (e.g., a pure antichain where
+        # no x < y pairs were found, or no C_1 >= 2 intervals found),
+        # return 0.0.
         return np.mean(ratios) if ratios else 0.0
 
     def get_mmd_energy(self, g: nx.DiGraph) -> float:
@@ -130,7 +149,7 @@ class CausalSetRewardProxy:
         preventing the 1D-chain-gets-zero-energy flaw.
         """
         try:
-            # 1. Get the average ratio. This will be 0.0 for 1D chains.
+            # 1. Get the average ratio. This will be 0.0 for antichains.
             avg_ratio = self.calculate_avg_mmd_ratio(g)
 
             # 2. Solve for the dimension *once* based on the average ratio.
@@ -166,9 +185,15 @@ class CausalSetRewardProxy:
         if n < 4: # BD action is trivial for < 4 nodes
             return 1e10
 
+        # --- ATTRIBUTE ERROR FIX ---
         # 1. Get Causal Matrix C (reflexive)
-        C_matrix = nx.transitive_closure_matrix(g, reflexive=True)
-        C_matrix = C_matrix.toarray().astype(np.int32)
+        # 'transitive_closure_matrix' is deprecated.
+        # The new method is to compute the closure, then get the matrix.
+        tc_g = nx.transitive_closure(g, reflexive=True)
+        # Ensure node order is [0, 1, ..., n-1] for matrix ops
+        node_list = sorted(g.nodes())
+        C_matrix = nx.adjacency_matrix(tc_g, nodelist=node_list).toarray().astype(np.int32)
+        # ---
 
         # 2. Compute all N^2 inclusive interval sizes |I[i, j]|
         # (Fix #3) The (i, j) entry of (C @ C) is sum_k C_ik * C_kj.
