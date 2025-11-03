@@ -29,11 +29,29 @@ from causet_env import CausalSetEnv
 from causet_policy import GNNPolicy
 from causet_reward import CausalSetRewardProxy
 
+# --- DEBUG ---
+_collate_fn_call_count = 0
+_last_collate_debug_print = 0
+# -----------
+
 def collate_fn(states: list[tuple]) -> Batch:
     """
     (Fix #4) Collates environment states into a PyG Batch
     with rich node features.
     """
+    # --- DEBUG ---
+    global _collate_fn_call_count, _last_collate_debug_print
+    _collate_fn_call_count += 1
+    current_time = time.time()
+    if (current_time - _last_collate_debug_print > 5.0) or (_collate_fn_call_count <= 5):
+        print(f"\n[DEBUG] collate_fn: Call #{_collate_fn_call_count}. Batch size: {len(states)}")
+        if states:
+            print(f"[DEBUG] collate_fn: First state: {states[0]}")
+            if len(states) > 1:
+                print(f"[DEBUG] collate_fn: Last state: {states[-1]}")
+        _last_collate_debug_print = current_time
+    # -----------
+
     data_list = []
     for (n, edges, _) in states:
         if n == 0:
@@ -49,7 +67,14 @@ def collate_fn(states: list[tuple]) -> Batch:
             g.add_edges_from(edges)
 
             # (Fix #3 Applied) Create rich node features efficiently.
-            tc = nx.transitive_closure(g, reflexive=False)
+            try:
+                # Use reflexive=False for ancestor/descendant counts
+                # Use reflexive=True for link prediction (not needed here)
+                tc = nx.transitive_closure_dag(g) # More efficient for DAGs
+            except Exception:
+                # Fallback for safety, though causets should be DAGs
+                tc = nx.transitive_closure(g, reflexive=False)
+
 
             features = []
             for i in range(n):
@@ -153,52 +178,83 @@ def main():
     start_time = time.time()
 
     for step in pbar:
-        agent.policy.train()
-        optimizer.zero_grad()
+        try:
+            agent.policy.train()
+            optimizer.zero_grad()
 
-        # Sample trajectories
-        # The 'env' must be passed to the sampling method.
-        # --- FIX ---
-        # Added the 'n=args.N' argument, which is required by the library.
-        trajectories = gflownet.sample_trajectories(
-            env, n_samples=args.batch_size, n=args.N
-        )
+            # Sample trajectories
+            # The 'env' must be passed to the sampling method.
+            # ---
+            # --- THE FIX ---
+            # The library's sampler (gfn/samplers.py) uses the 'n'
+            # argument as the BATCH SIZE and the MAX_LEN.
+            # We must pass args.batch_size here, not args.N,
+            # to ensure we sample the correct number of trajectories.
+            #
+            trajectories = gflownet.sample_trajectories(
+                env, n_samples=args.batch_size, n=args.batch_size
+            )
+            # -----------
+
+            # Calculate loss
+            # The 'env' must also be passed to the loss calculation.
+            loss = gflownet.calculate_loss(env, trajectories)
+
+            if not loss.isfinite():
+                print("\nWarning: Non-finite loss detected. Skipping step.")
+                # --- DEBUG ---
+                print("Dumping first trajectory from bad batch:")
+                print(trajectories[0])
+                # -----------
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+
+            if step % 100 == 0 or step == args.num_steps - 1:
+                # Log data
+                final_states_objects = [t.last_state for t in trajectories]
+                # --- DEBUG ---
+                # The old code `[t[-1]['state'] for t in trajectories]` is wrong
+                # for the 'torchgfn' library. Trajectories are objects.
+                # Use .states_list[0] to get the raw tuple from our ObjectStates
+                final_states = [s.states_list[0] for s in final_states_objects]
+                # -----------
+
+                # This logging code is still valid
+                energies_raw = [proxy.get_energy(env.state_to_graph(s)) for s in final_states]
+
+                # Filter invalid energies
+                valid_energies = [e for e in energies_raw if e < 1e9]
+                rewards = [math.exp(-args.beta * e) for e in valid_energies]
+
+                avg_energy = np.mean(valid_energies) if valid_energies else 1e9
+                avg_reward = np.mean(rewards) if rewards else 0.0
+
+                log_data.append({
+                    'step': step,
+                    'loss': loss.item(),
+                    'avg_energy': avg_energy,
+                    'avg_reward': avg_reward,
+                })
+
+                pbar.set_description(f"Step {step} | Loss: {loss.item():.3f} | Avg. Energy: {avg_energy:.3f}")
+
+        # --- DEBUG ---
+        except Exception as e:
+            print(f"\n\n--- CRITICAL ERROR AT STEP {step} ---")
+            print(f"Error: {e}")
+            print("--- Traceback ---")
+            import traceback
+            traceback.print_exc()
+            print("-----------------")
+            print("Skipping step and attempting to continue...")
+            if 'optimizer' in locals():
+                optimizer.zero_grad() # Clear grads to avoid corruption
+            time.sleep(1.0) # Pause to allow user to see error
         # -----------
 
-        # Calculate loss
-        # The 'env' must also be passed to the loss calculation.
-        loss = gflownet.calculate_loss(env, trajectories)
-
-        if not loss.isfinite():
-            print("\nWarning: Non-finite loss detected. Skipping step.")
-            continue
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-        optimizer.step()
-
-        if step % 100 == 0 or step == args.num_steps - 1:
-            # Log data
-            final_states = [t[-1]['state'] for t in trajectories]
-
-            # This logging code is still valid
-            energies_raw = [proxy.get_energy(env.state_to_graph(s)) for s in final_states]
-
-            # Filter invalid energies
-            valid_energies = [e for e in energies_raw if e < 1e9]
-            rewards = [math.exp(-args.beta * e) for e in valid_energies]
-
-            avg_energy = np.mean(valid_energies) if valid_energies else 1e9
-            avg_reward = np.mean(rewards) if rewards else 0.0
-
-            log_data.append({
-                'step': step,
-                'loss': loss.item(),
-                'avg_energy': avg_energy,
-                'avg_reward': avg_reward,
-            })
-
-            pbar.set_description(f"Step {step} | Loss: {loss.item():.3f} | Avg. Energy: {avg_energy:.3f}")
 
     print(f"Training complete in {time.time() - start_time:.2f}s")
 
@@ -215,15 +271,21 @@ def main():
     with torch.no_grad():
         while len(final_graphs) < 10000:
             # Also need to pass 'env' here for the final sampling.
-            # --- FIX ---
-            # Added the 'n=args.N' argument here as well.
+            # ---
+            # --- THE FIX ---
+            # Using args.batch_size for 'n' here as well.
             trajectories = gflownet.sample_trajectories(
-                env, n_samples=args.batch_size, n=args.N
+                env, n_samples=args.batch_size, n=args.batch_size
             )
             # -----------
+            # --- DEBUG ---
+            # Correctly extract final states from trajectory objects
+            final_states_objects = [t.last_state for t in trajectories]
+            final_states = [s.states_list[0] for s in final_states_objects]
             final_graphs.extend([
-                env.state_to_graph(t[-1]['state']) for t in trajectories
+                env.state_to_graph(s) for s in final_states
             ])
+            # -----------
             print(f"Collected {len(final_graphs)} / 10000 samples", end='\r')
 
     # Save ensemble

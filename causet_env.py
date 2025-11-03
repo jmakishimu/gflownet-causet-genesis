@@ -24,6 +24,9 @@ class CausalSetEnv(FactorEnv):
     correctly model the Classical Sequential Growth (CSG) model.
     """
     def __init__(self, max_nodes, proxy, device='cpu'):
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: Initializing environment with max_nodes={max_nodes}")
+        # -----------
         super().__init__()
         self.max_nodes = max_nodes
         self.proxy = proxy
@@ -50,6 +53,13 @@ class CausalSetEnv(FactorEnv):
         source_tuple = (0, (), ())
         self.source = source_tuple
 
+        # --- THE CORRECT FIX for the RuntimeError ---
+        # Set the class-level template for ObjectStates so that
+        # make_initial_states (called by the sampler) knows
+        # what the source state looks like.
+        self.States.set_source_state_template(source_tuple)
+        # ------------------------------------------
+
         # --- THE CORRECT FIX for the AttributeError ---
         #
         # We now use 'ObjectStates', which has a safe constructor
@@ -63,23 +73,42 @@ class CausalSetEnv(FactorEnv):
         self.state_shape = (1,)
 
         # 5a. MANUALLY SET THE CLASS ATTRIBUTE for state_shape.
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.state_shape = {self.state_shape}")
+        # -----------
         self.States.state_shape = self.state_shape
 
         # 3. Define s0 (source state object)
         #    This call now uses the 'ObjectStates' constructor,
         #    which will skip the broken assertion.
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: Creating self.s0...")
+        # -----------
         self.s0 = self.States([source_tuple])
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: self.s0 created. shape={self.s0.shape}")
+        # -----------
+
 
         # 3a. MANUALLY SET THE CLASS ATTRIBUTE for s0.
         #     Now that 'self.s0' exists, we set it as the class
         #     attribute so that 'sf' (and other states) can
         #     be created and validated against it.
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.s0 = self.s0")
+        # -----------
         self.States.s0 = self.s0
 
         # 4. Define sf (sink state object)
         #    This call will use the 'ObjectStates' constructor,
         #    which will now safely find 'self.States.s0' and succeed.
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: Creating self.sf...")
+        # -----------
         self.sf = self.States([self.eos_action])
+        # --- DEBUG ---
+        print(f"[DEBUG] CausalSetEnv.__init__: self.sf created. shape={self.sf.shape}")
+        print(f"[DEBUG] CausalSetEnv.__init__: Environment initialization complete.")
         # -----------
 
         # Pre-compute masks for efficiency
@@ -215,13 +244,22 @@ class CausalSetEnv(FactorEnv):
         # --- FIX ---
         # Extract raw tuples from the States object, similar to FactorPreAggAgent
         try:
-            raw_states: List[tuple] = list(final_states.tensor.flat)
+            # --- DEBUG ---
+            # Use .states_list, which is the correct attribute
+            raw_states: List[tuple] = final_states.states_list
+            # ---
         except AttributeError:
-            raw_states: List[tuple] = list(final_states)
-        except Exception:
+            try:
+                raw_states: List[tuple] = list(final_states.tensor.flat)
+            except AttributeError:
+                raw_states: List[tuple] = list(final_states)
+        except Exception as e:
+            # --- DEBUG ---
+            print(f"[DEBUG] CausalSetEnv.get_log_reward: CRITICAL ERROR extracting states. States object: {final_states}")
+            # -----------
             raise ValueError(
-                "CausalSetEnv could not extract raw states (tuples) "
-                "from the gfn.States object."
+                f"CausalSetEnv could not extract raw states (tuples) "
+                f"from the gfn.States object. Error: {e}"
             )
         # -----------
 

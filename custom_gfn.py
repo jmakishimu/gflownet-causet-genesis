@@ -12,6 +12,7 @@ import numpy as np
 from torch_geometric.data import Batch
 from abc import ABC, abstractmethod
 from typing import Callable, List, Any
+import time  # --- DEBUG ---
 
 # Import from the provided library files
 from gfn.env import Env
@@ -130,6 +131,9 @@ class ObjectStates(States):
     @classmethod
     def set_source_state_template(cls, source_tuple):
         """Helper to set the tuple used for s0 generation."""
+        # --- DEBUG ---
+        print(f"[DEBUG] ObjectStates: Setting source state template to: {source_tuple}")
+        # -----------
         cls._source_state_tuple = source_tuple
 
     def __init__(self, states_list: List[Any], device: torch.device = None):
@@ -139,10 +143,46 @@ class ObjectStates(States):
         self.tensor = torch.arange(len(states_list), dtype=torch.long, device=cpu_device)
         self.shape = self.tensor.shape
 
+        # --- DEBUG ---
+        # --- THE FIX ---
+        # The 'self.s0' property relies on the *class attribute* 'self.__class__.s0'.
+        # When creating the first s0 instance, this class attribute is not set yet.
+        # This getattr() chain safely checks if the class attribute exists,
+        # then checks if it has a shape, all without erroring.
+        s0_shape = getattr(getattr(self.__class__, "s0", None), "shape", "N/A")
+        # ---
+        print(f"[DEBUG] ObjectStates.__init__: Created batch. self.shape={self.shape}, self.s0.shape={s0_shape}, first state={states_list[0]}")
+        # -----------
+
         if hasattr(self, "s0") and self.s0 is not None:
-            assert self.s0.shape == self.shape
-        else:
+            # ---
+            # --- THE FIX ---
+            # This assertion fails when creating a new batch (e.g., shape (128,))
+            # because self.s0 is the canonical s0 batch (shape (1,)).
+            # This check is invalid for our object-based states.
+            # assert self.s0.shape == self.shape
+            # ---
             pass
+        else:
+            # --- DEBUG ---
+            print(f"[DEBUG] ObjectStates.__init__: self.s0 is not set yet (this is OK if creating s0).")
+            # -----------
+            pass
+
+    # ---
+    # --- THE FIX for the IndexError ---
+    #
+    @property
+    def batch_shape(self) -> torch.Size:
+        """
+        Overrides the base class's n_dims calculation, which
+        fails for our ObjectStates wrapper.
+        For ObjectStates, the batch_shape is just the shape
+        of our dummy tensor (e.g., torch.Size([128])).
+        """
+        return self.shape # self.shape is self.tensor.shape
+    # ---
+    # ---
 
     @classmethod
     def make_initial_states(cls, batch_shape: tuple[int, ...],
@@ -150,6 +190,10 @@ class ObjectStates(States):
         """
         Creates a batch of initial (source) states for the GFN sampler.
         """
+        # --- DEBUG ---
+        print(f"[DEBUG] ObjectStates.make_initial_states: Called with batch_shape={batch_shape}")
+        # -----------
+
         if cls._source_state_tuple is None:
             raise RuntimeError("Source state template not set for ObjectStates.")
 
@@ -331,6 +375,11 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
         # Ensure policy is on the correct device
         self.policy.to(self.device)
 
+        # --- DEBUG ---
+        self.get_logits_call_count = 0
+        self.last_debug_print_time = 0
+        # -----------
+
     @property
     def expected_output_dim(self) -> int:
         """
@@ -344,85 +393,141 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
         Calculates the logits for the current factor decision for each state.
         This method is called by 'TBGFlowNet'.
         """
+        # --- DEBUG ---
+        self.get_logits_call_count += 1
+        current_time = time.time()
+        do_debug_print = (current_time - self.last_debug_print_time > 5.0) or (self.get_logits_call_count <= 5)
+        if do_debug_print:
+            print(f"\n[DEBUG] FactorPreAggAgent.get_logits: Call #{self.get_logits_call_count}")
+            self.last_debug_print_time = current_time
+        # -----------
+
         if backward:
             raise NotImplementedError(
                 "FactorPreAggAgent does not support backward sampling."
             )
 
         # 1. Extract raw state tuples from the States container.
-        #    This works because the 'env.States' is 'ObjectStates',
-        #    so 'states.tensor' is a 'dtype=object' tensor.
         try:
-            raw_states: List[tuple] = list(states.tensor.flat)
+            # --- DEBUG ---
+            # Changed 'states.tensor.flat' to 'states.states_list'
+            # This is the correct way to get states from our ObjectStates
+            raw_states: List[tuple] = states.states_list
+            # ---
         except AttributeError:
-            # Fallback if the 'States' object is already flat or different
-            raw_states: List[tuple] = list(states)
-        except Exception:
+            # Fallback for other States objects
+            try:
+                raw_states: List[tuple] = list(states.tensor.flat)
+            except AttributeError:
+                raw_states: List[tuple] = list(states)
+        except Exception as e:
+            # --- DEBUG ---
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR extracting states. States object: {states}")
+            # -----------
             raise ValueError(
-                "FactorPreAggAgent could not extract raw states (tuples) "
-                "from the gfn.States object."
+                f"FactorPreAggAgent could not extract raw states (tuples) "
+                f"from the gfn.States object. Error: {e}"
             )
 
         if not raw_states:
+            # --- DEBUG ---
+            if do_debug_print:
+                print(f"[DEBUG] FactorPreAggAgent.get_logits: Received empty raw_states list.")
+            # -----------
             return torch.empty(0, len(self.env.action_space)).to(self.device)
+
+        # --- DEBUG ---
+        if do_debug_print:
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: Processing batch of {len(raw_states)} states.")
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: First state in batch: {raw_states[0]}")
+            if len(raw_states) > 1:
+                print(f"[DEBUG] FactorPreAggAgent.get_logits: Last state in batch: {raw_states[-1]}")
+        # -----------
 
         # 2. Collate states into a PyG batch
         #    The collate_fn creates the PyG Batch, which we then
         #    move to the 'self.device' (e.g., 'cuda').
-        pyg_batch = self.collate_fn(raw_states).to(self.device)
+        try:
+            pyg_batch = self.collate_fn(raw_states).to(self.device)
+        except Exception as e:
+            print(f"\n[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR in collate_fn.")
+            print(f"Error: {e}")
+            print(f"First 5 raw_states: {raw_states[:5]}")
+            raise e
 
         # 3. Get logits for all nodes in the batch from the policy
         #    Shape: [total_nodes, num_actions]
-        all_node_logits = self.policy(pyg_batch)
+        try:
+            all_node_logits = self.policy(pyg_batch)
+        except Exception as e:
+            print(f"\n[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR in self.policy(pyg_batch).")
+            print(f"Error: {e}")
+            print(f"pyg_batch.x shape: {pyg_batch.x.shape}, device: {pyg_batch.x.device}")
+            print(f"pyg_batch.edge_index shape: {pyg_batch.edge_index.shape}, device: {pyg_batch.edge_index.device}")
+            raise e
 
         # 4. Select the logits for the *current* factor of each state
         selected_logits: List[torch.Tensor] = []
         ptr = pyg_batch.ptr.to(self.device)
         n_actions = len(self.env.action_space)
 
+        # --- DEBUG ---
+        if do_debug_print:
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: Got all_node_logits shape: {all_node_logits.shape}")
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: pyg_batch.ptr: {ptr}")
+        # -----------
+
         for i, state in enumerate(raw_states):
-            num_factors = self.num_factors_fn(state) # e.g., 'n'
+            try:
+                num_factors = self.num_factors_fn(state) # e.g., 'n'
 
-            # state is (n, edges, partial_v)
-            partial_v = state[2]
-            factor_idx = len(partial_v)
+                # state is (n, edges, partial_v)
+                partial_v = state[2]
+                factor_idx = len(partial_v)
 
-            if factor_idx < num_factors:
-                # --- This is a factor-decision step ---
+                if factor_idx < num_factors:
+                    # --- This is a factor-decision step ---
+                    stage = state[0]
+                    node_start_idx = ptr[i]
+                    global_node_idx = node_start_idx + factor_idx
+                    logits = all_node_logits[global_node_idx]
+                    mask = self.env.get_mask(state, stage, factor_idx).to(self.device)
+                    logits = logits.masked_fill(~mask, -1e10)
+                    selected_logits.append(logits)
 
-                # Get the stage (which is 'n')
-                stage = state[0]
+                else:
+                    # --- This is a stage-transition step ---
+                    trans_logits = torch.full((n_actions,), -1e10,
+                                              device=self.device)
+                    trans_logits[0] = 0.0
+                    selected_logits.append(trans_logits)
 
-                # Find the global node index for this factor
-                node_start_idx = ptr[i]
-                global_node_idx = node_start_idx + factor_idx
-
-                # Select the logits for this specific factor
-                logits = all_node_logits[global_node_idx]
-
-                # Apply the environment's specific mask for this factor
-                mask = self.env.get_mask(state, stage, factor_idx).to(self.device)
-
-                # Apply mask (use -1e10 for numerical stability)
-                logits = logits.masked_fill(~mask, -1e10)
-                selected_logits.append(logits)
-
-            else:
-                # --- This is a stage-transition step ---
-                # (e.g., n=0 or all factors for n are done)
-                #
-                # The 'step' function will now transition to the next stage
-                # (e.g., (n+1, ..., ())) regardless of the action.
-                # We force "action 0" as the only valid choice.
-
-                trans_logits = torch.full((n_actions,), -1e10,
-                                          device=self.device)
-                trans_logits[0] = 0.0
-                selected_logits.append(trans_logits)
+            except Exception as e:
+                print(f"\n[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR during logit selection loop.")
+                print(f"Error: {e}")
+                print(f"Failing state (i={i}): {state}")
+                # --- DEBUG ---
+                # Add print statements for variables that might not be defined
+                # if the error happens early in the try block
+                print(f"State: {state}")
+                if 'num_factors' in locals():
+                    print(f"num_factors: {num_factors}, factor_idx: {factor_idx}")
+                if 'node_start_idx' in locals():
+                    print(f"ptr: {ptr}, node_start_idx: {node_start_idx}, global_node_idx: {global_node_idx}")
+                # ---
+                print(f"all_node_logits shape: {all_node_logits.shape}")
+                raise e
 
         # Stack the selected logits for the batch
         # Shape: [batch_size, num_actions]
-        return torch.stack(selected_logits)
+        final_logits = torch.stack(selected_logits)
+
+        # --- DEBUG ---
+        if do_debug_print:
+            print(f"[DEBUG] FactorPreAggAgent.get_logits: Success. Returning final_logits shape: {final_logits.shape}")
+        # -----------
+
+        return final_logits
 
     def forward(self, states: States, backward: bool = False) -> torch.Tensor:
         """
