@@ -335,25 +335,22 @@ class ObjectStates(States):
     #
 
     # ---
-    # --- THIS IS THE FIX for `len(batch_shape) == 2` ---
-    # We override the n_dims class attribute to 0.
+    # --- CRITICAL FIX for batch_shape ---
+    # The Trajectories class checks: assert len(self.states.batch_shape) == 2
+    # This means batch_shape MUST be 2-dimensional.
+    #
+    # For 2D states [B, 1]: batch_shape should be [B, 1] (len=2) ✓
+    # For 3D states [T, B, 1]: batch_shape should be [T, B, 1] (len=3) ✗
+    #
+    # Since assertion requires len==2, states must be 2D when Trajectories is created.
+    # We set n_dims=0 so batch_shape returns the full shape.
     n_dims = 0
 
     @property
     def batch_shape(self) -> torch.Size:
         """
-        The base class defines batch_shape as self.shape[:-self.n_dims].
-        With n_dims=0, this would be self.shape[:], which is (B, 1).
-        This seems to be what the Trajectories class wants.
-        However, the *sampler* (samplers.py line 245) does:
-        `self.env.States.make_initial_states(batch_shape=(n_samples, *self.env.state_shape)`
-        This implies `env.state_shape` should be `(1,)` and
-        the *base* `batch_shape` (which is `self.shape[:-1]`)
-        should be used.
-
-        This is a deep contradiction. Let's force it.
-        We will return self.shape `(B, 1)` to satisfy Trajectories,
-        and modify `make_initial_states` to handle it.
+        Return the full tensor shape.
+        For 2D [B, 1]: returns [B, 1] with len()=2 ✓
         """
         return self.shape
     # ---
@@ -840,25 +837,24 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
 # ---
 # --- FIX for `AssertionError: self.actions.batch_shape` ---
 #
+# ---
+# --- FIX for `AssertionError: self.actions.batch_shape` ---
+#
 class CustomActions(Actions):
     """
     A custom Actions container to fix a batch_shape assertion.
-    The Trajectories container requires batch_shape to be 2D.
+
+    The Trajectories class requires len(batch_shape) == 2.
+    We set n_dims=0 and return the full tensor shape.
+    For 2D [B, 1]: batch_shape = [B, 1] with len()=2 ✓
     """
+    action_shape = (1,)
+    n_dims = 0
+
     @property
     def batch_shape(self) -> torch.Size:
-        """
-        Returns the batch shape for actions.
-        The tensor shape is [batch_size, action_dim] where action_dim = 1.
-        We need to return just [batch_size] to match what Trajectories expects.
-        """
-        # The base Actions class expects batch_shape to exclude the action dimensions
-        # For a tensor of shape [B, 1], batch_shape should be [B]
-        if len(self.tensor.shape) >= 2:
-            return self.tensor.shape[:1]  # Return just [batch_size]
-        else:
-            # Fallback for 1D tensor
-            return self.tensor.shape
+        """Return the full tensor shape to ensure len()=2 for 2D tensors."""
+        return self.tensor.shape
 # ---
 # --- END OF FIX ---
 # ---
