@@ -1,0 +1,24 @@
+# Directories to ignore as requested
+enc/
+pkg/
+results/
+
+# Python virtual environment
+venv/
+
+# Compiled files and caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Data and checkpoint files
+*.pkl
+*.pt
+*.pth
+*.csv
+*.zip
+
+# OS and Editor files
+.DS_Store
+.idea/
+.vscode/

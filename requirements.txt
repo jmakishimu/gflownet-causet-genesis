@@ -1,0 +1,26 @@
+#
+# gflownet-causet-genesis/requirements.txt
+#
+# --- SOTA Repos ---
+# 1. GFlowNet Engine
+torchgfn
+# 2. GNN Policy Engine
+torch_geometric
+
+# 3. Causal Set Physics Engine
+# Note: The 'c-minz/Python-causets' repo is not a package.
+# We will use its logic, but it's not a pip-installable dependency.
+# REVIEWER 2 NOTE: This is a maintenance risk. Core physics logic
+# implemented from a non-package source is fragile and hard to verify.
+# The 'causets' library on PyPI is different.
+# --- Core ML ---
+torch
+
+# --- Utilities ---
+networkx
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+tqdm
