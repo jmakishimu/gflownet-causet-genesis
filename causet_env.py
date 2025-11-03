@@ -4,183 +4,196 @@
 import torch
 import networkx as nx
 import numpy as np
-from typing import List, Any
+from typing import Tuple
+from gfn.env import Env
 from gfn.states import States
-from custom_gfn import FactorEnv, ObjectStates
-# --- FIX: Import CustomActions ---
-from custom_gfn import CustomActions
-# ---
 
-class CausalSetEnv(FactorEnv):
-    """
-    Implements the Causal Set Environment (Phase 1)
 
-    This robust implementation uses the FactorEnv framework to
-    correctly model the Classical Sequential Growth (CSG) model.
+class CausalSetEnv(Env):
     """
-    def __init__(self, max_nodes, proxy, device='cpu'):
-        super().__init__()
+    Implements the Causal Set Environment using proper torchgfn integration.
+
+    State representation: A tensor [n, edge_bits...] where:
+    - n: current number of nodes (0 to max_nodes)
+    - edge_bits: flattened upper triangular adjacency matrix
+
+    Action: An integer representing which edge to add/toggle, or EOS action
+    """
+    def __init__(self, max_nodes: int, proxy, device='cpu'):
         self.max_nodes = max_nodes
         self.proxy = proxy
-
         self._device = torch.device(device)
 
-        self.States = ObjectStates
+        # Calculate state dimension
+        # We need to store: current n + all possible edges
+        self.max_edges = (max_nodes * (max_nodes - 1)) // 2
+        self.state_dim = 1 + self.max_edges  # [n, edge_0, edge_1, ...]
 
-        self.action_space = [0, 1]
-        self.eos_action = -1
+        # Action space: for each stage n, we can add edges from previous nodes
+        # Action encoding: choose which node (0 to n-1) to connect, or EOS
+        # We'll use a simpler sequential approach: at stage n, decide n binary actions
+        self.action_dim = max_nodes  # Maximum actions per stage
 
-        # --- FIX: Use CustomActions instead of base Actions ---
-        self.Actions = CustomActions
-        # ---
+        # Initialize s0: [0, 0, 0, ...] - no nodes, no edges
+        s0_tensor = torch.zeros((1, self.state_dim), dtype=torch.float, device=self._device)
 
-        self.n_actions = len(self.action_space)
-        self.policy_output_dim = self.n_actions
+        # Initialize sf: marked by n = max_nodes + 1 (terminal marker)
+        sf_tensor = torch.full((1, self.state_dim), -1.0, dtype=torch.float, device=self._device)
 
-        # --- FIX: Set action_shape on CustomActions ---
-        self.Actions.action_shape = (1,)
-        # ---
+        # Call parent init with proper state shape
+        super().__init__(
+            s0=s0_tensor,
+            sf=sf_tensor,
+            device=self._device,
+        )
 
-        self.Actions.dummy_action = torch.tensor([self.eos_action], device=self._device)
-        self.Actions.exit_action = torch.tensor([self.eos_action], device=self._device)
+        # Store preprocessor for state features
+        self.preprocessor = None
 
-        self.check_action_validity = False
-        self.is_vectorized = False
+    def make_States_class(self) -> type[States]:
+        """Required by torchgfn - return the States class to use"""
+        return States
 
-        source_tuple = (0, (), ())
-        self.source = source_tuple
+    def _get_edge_index(self, i: int, j: int) -> int:
+        """Convert node pair (i,j) where i<j to edge index in state vector"""
+        if i >= j:
+            raise ValueError(f"Invalid edge: i={i} must be < j={j}")
+        # Map (i,j) to flat index in upper triangular matrix
+        # For max_nodes, we have edges: (0,1), (0,2), ..., (0,n-1), (1,2), ..., (n-2,n-1)
+        return i * self.max_nodes - (i * (i + 1)) // 2 + (j - i - 1)
 
-        self.States.set_source_state_template(source_tuple)
+    def _decode_state(self, state_tensor: torch.Tensor) -> Tuple[int, torch.Tensor]:
+        """Extract current n and edge adjacency from state tensor"""
+        n = int(state_tensor[0].item())
+        edges = state_tensor[1:]
+        return n, edges
 
-        self.state_shape = (1,)
-        self.States.state_shape = self.state_shape
+    def _state_to_graph(self, state_tensor: torch.Tensor) -> nx.DiGraph:
+        """Convert state tensor to networkx DiGraph"""
+        n, edges = self._decode_state(state_tensor)
 
-        self.s0 = self.States([source_tuple], device=self._device)
-        self.States.s0 = self.s0
+        g = nx.DiGraph()
+        g.add_nodes_from(range(n))
 
-        self.sf = self.States([self.eos_action], device=self._device)
-        self.States.sf = self.sf
+        # Reconstruct edges from state
+        for i in range(n):
+            for j in range(i + 1, n):
+                edge_idx = self._get_edge_index(i, j)
+                if edges[edge_idx].item() > 0.5:  # Edge exists
+                    g.add_edge(i, j)
 
-        self.mask_valid = torch.tensor([True, True], device=self._device)
-        self.mask_force_0 = torch.tensor([True, False], device=self._device)
-        self.mask_force_1 = torch.tensor([False, True], device=self._device)
+        # Ensure transitivity
+        tc = nx.transitive_closure(g)
+        return tc
 
-        self._graph_cache = {}
-
-        # --- FIX: CRITICAL - Patch ObjectStates with environment config ---
-        # This allows ObjectStates.is_sink_state to correctly identify terminal states
-        ObjectStates.patch_env_config(env_max_nodes=self.max_nodes, sf_value=self.eos_action)
-        print(f"[DEBUG] CausalSetEnv: Patched ObjectStates with max_nodes={self.max_nodes}, eos_action={self.eos_action}")
-        # ---
-
-    def get_action_space(self, state):
-        return self.action_space
-
-    def get_num_factors(self, state):
-        """ The number of factors (decisions) in this stage is n. """
-        n, _, _ = state
-        return n
-
-    def get_mask(self, state, stage, factor_idx):
+    def step(self, states: States, actions: torch.Tensor) -> States:
         """
-        Provides a mask for valid actions, enforcing transitivity.
+        Apply actions to states. This follows the CSG model:
+        - At stage n, we make n binary decisions (one per existing node)
+        - After n decisions, we add node n and transition to stage n+1
         """
-        n, edges, partial_v = state
-        i = factor_idx
+        new_states = states.clone()
 
-        graph_key = (n, edges)
-        if graph_key not in self._graph_cache:
-            g = nx.DiGraph()
-            g.add_nodes_from(range(n))
-            g.add_edges_from(edges)
-            self._graph_cache[graph_key] = g
+        for i in range(len(states)):
+            if states.is_sink_state[i]:
+                continue
 
-        g = self._graph_cache[graph_key]
+            state = states.tensor[i]
+            action = actions[i].item()
+            n = int(state[0].item())
 
-        for j, v_j in enumerate(partial_v):
-            if g.has_edge(j, i) and v_j == 0:
-                return self.mask_force_0
+            # Check if we're at terminal state
+            if n >= self.max_nodes:
+                new_states[i] = self.sf.tensor[0]
+                continue
 
-        return self.mask_valid
+            # Sequential action application
+            # We need to track which decision we're making (0 to n-1)
+            # This is encoded in the state itself
 
-    def _step_single(self, state: Any, action: Any) -> tuple[Any, Any, bool]:
-        """
-        Applies a single action to a single state.
-        """
-        try:
-            action_int = action.tensor.item()
-        except AttributeError:
-            action_int = int(action)
-        except Exception:
-            action_int = int(action)
+            # Simple approach: each step adds one connection decision
+            # Action = 0 or 1 (no edge / edge to node i)
+            # We track decision index in a separate way
 
-        n, edges, partial_v = state
+            # For simplicity: action encodes both the node index and decision
+            # action = node_idx * 2 + decision (0 or 1)
+            # EOS action = -1
 
-        if n == self.max_nodes:
-            return state, self.eos_action, True
+            if action < 0:  # EOS - move to next stage
+                # Add new node
+                new_state = state.clone()
+                new_state[0] = n + 1
+                new_states[i] = new_state
+            else:
+                # Apply edge decision
+                node_idx = action // 2
+                decision = action % 2
 
-        factor_idx = len(partial_v)
-        num_factors = self.get_num_factors(state)
-        is_done = False
-        action_taken = action_int
+                if node_idx < n and decision == 1:
+                    # Add edge from node_idx to n
+                    edge_idx = self._get_edge_index(node_idx, n) + 1  # +1 for n offset
+                    new_state = state.clone()
+                    new_state[edge_idx] = 1.0
+                    new_states[i] = new_state
+                else:
+                    # No edge, just continue
+                    new_states[i] = state
 
-        if factor_idx == num_factors:
-            new_n = n + 1
-            new_node = n
+        return new_states
 
-            new_edges_list = list(edges)
-            for j, v_j in enumerate(partial_v):
-                if v_j == 1:
-                    new_edges_list.append((j, new_node))
-            new_edges = tuple(new_edges_list)
+    def backward_step(self, states: States, actions: torch.Tensor) -> States:
+        """Backward sampling not implemented for causal sets"""
+        raise NotImplementedError("Backward sampling not supported")
 
-            new_state = (new_n, new_edges, ())
+    def is_action_valid(self, states: States, actions: torch.Tensor,
+                       backward: bool = False) -> torch.Tensor:
+        """Check if actions are valid for given states"""
+        if backward:
+            return torch.zeros(len(states), dtype=torch.bool, device=self._device)
 
-            if new_n == self.max_nodes:
-                is_done = True
+        valid = torch.ones(len(states), dtype=torch.bool, device=self._device)
 
-            self._graph_cache = {}
-            action_taken = self.eos_action
+        for i in range(len(states)):
+            state = states.tensor[i]
+            n = int(state[0].item())
+            action = actions[i].item()
 
-        else:
-            new_partial_v = partial_v + (action_int,)
-            new_state = (n, edges, new_partial_v)
+            # Terminal state - no valid actions
+            if n >= self.max_nodes:
+                valid[i] = False
+                continue
 
-        return new_state, action_taken, is_done
+            # Check action bounds
+            if action >= 0:
+                node_idx = action // 2
+                if node_idx >= n:
+                    valid[i] = False
+
+        return valid
 
     def get_log_reward(self, final_states: States) -> torch.Tensor:
         """
-        Compute the log reward (unexponentiated energy) for a batch.
+        Compute log reward (negative energy) for final states.
         """
         rewards = []
 
-        try:
-            raw_states: List[tuple] = final_states.states_list
-        except AttributeError:
-            try:
-                raw_states: List[tuple] = list(final_states.tensor.flat)
-            except AttributeError:
-                raw_states: List[tuple] = list(final_states)
-        except Exception as e:
-            print(f"[DEBUG] CausalSetEnv.get_log_reward: CRITICAL ERROR extracting states. States object: {final_states}")
-            raise ValueError(
-                f"CausalSetEnv could not extract raw states (tuples) "
-                f"from the gfn.States object. Error: {e}"
-            )
+        for i in range(len(final_states)):
+            state = final_states.tensor[i]
+            n = int(state[0].item())
 
-        for state in raw_states:
-            n, edges, _ = state
             if n != self.max_nodes:
+                # Incomplete trajectory - very low reward
                 rewards.append(-1e10)
             else:
-                g = self.state_to_graph(state)
-                rewards.append(self.proxy.get_energy(g))
+                # Convert to graph and get energy
+                g = self._state_to_graph(state)
+                energy = self.proxy.get_energy(g)
 
-        return torch.tensor(rewards, device=self._device, dtype=torch.float)
+                # Log reward = -energy (lower energy = higher reward)
+                rewards.append(-energy)
 
-    def state_to_graph(self, state):
-        n, edges, _ = state
-        g = nx.DiGraph()
-        g.add_nodes_from(range(n))
-        g.add_edges_from(edges)
-        return g
+        return torch.tensor(rewards, dtype=torch.float, device=self._device)
+
+    def log_reward(self, final_states: States) -> torch.Tensor:
+        """Alias for get_log_reward to match torchgfn API"""
+        return self.get_log_reward(final_states)
