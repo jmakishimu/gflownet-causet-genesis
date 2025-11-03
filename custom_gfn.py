@@ -779,15 +779,29 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
 
         for i, state in enumerate(raw_states):
             try:
-                num_factors = self.num_factors_fn(state) # e.g., 'n'
+                # --- UNPACK STATE FIRST ---
+                n, edges, partial_v = state
 
-                # state is (n, edges, partial_v)
-                partial_v = state[2]
+                num_factors = self.num_factors_fn(state) # e.g., 'n'
                 factor_idx = len(partial_v)
 
-                if factor_idx < num_factors:
+                # ---
+                # --- THIS IS THE CRITICAL FIX ---
+                #
+                # First, check if the state is *already* terminal.
+                # (self.env is CausalSetEnv, which has max_nodes)
+                if n == self.env.max_nodes:
+                    # This is a terminal state, e.g., (15, ...).
+                    # Force a "stage transition" (action 0). The sampler
+                    # will see this and correctly terminate the trajectory.
+                    trans_logits = torch.full((n_actions,), -1e10,
+                                              device=self.device)
+                    trans_logits[0] = 0.0
+                    selected_logits.append(trans_logits)
+
+                elif factor_idx < num_factors:
                     # --- This is a factor-decision step ---
-                    stage = state[0]
+                    stage = n # Use n as stage
                     node_start_idx = ptr[i]
                     global_node_idx = node_start_idx + factor_idx
                     logits = all_node_logits[global_node_idx]
@@ -797,7 +811,7 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
 
                 else:
                     # --- This is a stage-transition step ---
-                    # (This includes s0 and terminal states)
+                    # (This includes s0 and non-terminal states < max_nodes)
                     trans_logits = torch.full((n_actions,), -1e10,
                                               device=self.device)
                     trans_logits[0] = 0.0

@@ -258,6 +258,20 @@ class CausalSetEnv(FactorEnv):
 
         # `state` is a Python tuple
         n, edges, partial_v = state
+
+        # ---
+        # --- THIS IS THE CORRECT FIX ---
+        #
+        # If the sampler incorrectly calls step() on an *already terminal*
+        # state (where n == max_nodes), we must immediately return
+        # that it is 'done' and not process any factor actions.
+        # This stops the agent from creating n=16.
+        if n == self.max_nodes:
+            return state, self.eos_action, True
+        # ---
+        # --- END OF FIX ---
+        # ---
+
         factor_idx = len(partial_v)
         num_factors = self.get_num_factors(state)
         is_done = False
@@ -276,8 +290,18 @@ class CausalSetEnv(FactorEnv):
 
             new_state = (new_n, new_edges, ())
 
+            # --- START DEBUG PRINT ---
+            # Add these print statements to see what the values are
+            print(f"[DEBUG] STAGE TRANSITION: new_n={new_n}, self.max_nodes={self.max_nodes}")
+            # --- END DEBUG PRINT ---
+
             if new_n == self.max_nodes:
                 is_done = True
+
+                # --- START DEBUG PRINT ---
+                # This will print ONLY if the stop condition is met
+                print(f"[DEBUG] STOP CONDITION MET. Setting is_done = True.")
+                # --- END DEBUG PRINT ---
 
             self._graph_cache = {}
 
