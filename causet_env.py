@@ -8,7 +8,12 @@ from typing import List, Any
 # --- FIX ---
 # Import the base 'States' (for type hints) and our new 'ObjectStates'
 from gfn.states import States
-from custom_gfn import FactorEnv, ObjectStates
+# ---
+# --- NEW FIX ---
+# Import CustomActions as well
+from custom_gfn import FactorEnv, ObjectStates, CustomActions
+# ---
+# ---
 # --- FIX for 'Actions' AttributeError & ImportError ---
 # Import the base 'Actions' class from gfn.actions
 from gfn.actions import Actions
@@ -28,7 +33,7 @@ class CausalSetEnv(FactorEnv):
     """
     def __init__(self, max_nodes, proxy, device='cpu'):
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: Initializing environment with max_nodes={max_nodes}")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Initializing environment with max_nodes={max_nodes}")
         # -----------
         super().__init__()
         self.max_nodes = max_nodes
@@ -55,8 +60,11 @@ class CausalSetEnv(FactorEnv):
         # --- FIX for 'Actions' AttributeError ---
         # We must manually set the attributes that gfn.Env.__init__
         # would normally set for the sampler to work.
-        # We use the base 'Actions' class.
-        self.Actions = Actions
+        # ---
+        # --- NEW FIX: Use CustomActions ---
+        self.Actions = CustomActions
+        # ---
+        # ---
 
         # n_actions = len(self.action_space). The sampler/policy
         # deals with [0, 1]. The eos_action (-1) is handled by
@@ -81,6 +89,14 @@ class CausalSetEnv(FactorEnv):
         # The sampler checks this flag. Since our agent handles masking,
         # we can disable the env's check.
         self.check_action_validity = False
+
+        # ---
+        # --- FIX for Vectorized Env Flag ---
+        # We must tell the library we are *not* vectorized,
+        # so it correctly calls the non-vectorized `_step`
+        # which iterates and calls our `step` -> `_step_single`.
+        self.is_vectorized = False
+        # ---
         # ---
 
         # 2. Define the source state as a raw tuple.
@@ -108,7 +124,7 @@ class CausalSetEnv(FactorEnv):
 
         # 5a. MANUALLY SET THE CLASS ATTRIBUTE for state_shape.
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.state_shape = {self.state_shape}")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.state_shape = {self.state_shape}")
         # -----------
         self.States.state_shape = self.state_shape
 
@@ -116,14 +132,14 @@ class CausalSetEnv(FactorEnv):
         #    This call now uses the 'ObjectStates' constructor,
         #    which will skip the broken assertion.
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: Creating self.s0...")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Creating self.s0...")
         # -----------
         # --- DEVICE FIX ---
         # Pass the correct device to the States constructor.
         self.s0 = self.States([source_tuple], device=self._device)
         # ---
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: self.s0 created. shape={self.s0.shape}")
+        # print(f"[DEBUG] CausalSetEnv.__init__: self.s0 created. shape={self.s0.shape}")
         # -----------
 
 
@@ -132,7 +148,7 @@ class CausalSetEnv(FactorEnv):
         #     attribute so that 'sf' (and other states) can
         #     be created and validated against it.
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.s0 = self.s0")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.s0 = self.s0")
         # -----------
         self.States.s0 = self.s0
 
@@ -140,22 +156,22 @@ class CausalSetEnv(FactorEnv):
         #    This call will use the 'ObjectStates' constructor,
         #    which will now safely find 'self.States.s0' and succeed.
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: Creating self.sf...")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Creating self.sf...")
         # -----------
         # --- DEVICE FIX ---
         # Pass the correct device to the States constructor.
         self.sf = self.States([self.eos_action], device=self._device)
         # ---
         # --- DEBUG ---
-        print(f"[DEBUG] CausalSetEnv.__init__: self.sf created. shape={self.sf.shape}")
+        # print(f"[DEBUG] CausalSetEnv.__init__: self.sf created. shape={self.sf.shape}")
 
         # --- FIX for 'is_sink_state' CRITICAL ERROR ---
         # We must set the CLASS attribute for sf, just like we did for s0.
         self.States.sf = self.sf
-        print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.sf = self.sf")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Setting self.States.sf = self.sf")
         # ---
 
-        print(f"[DEBUG] CausalSetEnv.__init__: Environment initialization complete.")
+        # print(f"[DEBUG] CausalSetEnv.__init__: Environment initialization complete.")
         # -----------
 
         # Pre-compute masks for efficiency
@@ -172,8 +188,16 @@ class CausalSetEnv(FactorEnv):
         return self.action_space
 
     def get_num_factors(self, state):
-        """ The number of factors (decisions) in this stage is n. """
+        """
+        The number of factors (decisions) in this stage is n.
+
+        --- THIS IS FIX #1 ---
+        When we *are* at the max_nodes state (e.g., n=15),
+        the number of factors is 0, signalling a terminal state.
+        """
         n, _, _ = state
+        if n == self.max_nodes:
+            return 0 # This is a terminal state, no more factors.
         return n
 
     def get_mask(self, state, stage, factor_idx):
@@ -216,64 +240,90 @@ class CausalSetEnv(FactorEnv):
     # ---
     # --- THIS IS THE FIX ---
     #
-    def step(self, states: ObjectStates, actions: Actions) -> ObjectStates:
+    # The traceback shows the sampler calls `env._step` (non-vectorized),
+    # which iterates and calls `env.step` (single-state).
+    # Your `step` was vectorized, causing the error.
+    #
+    # We rename your logic to `_step_single` and call it from `step`,
+    # which is defined in the `FactorEnv` base class.
+    # This correctly implements the non-vectorized API the
+    # sampler is using.
+
+    def _step_single(self, state: Any, action: Any) -> tuple[Any, Any, bool]:
         """
-        Apply a batch of actions to a batch of states.
-        This overrides the base Env.step method.
+        Applies a single action to a single state.
+        This is the original logic from your `step` function,
+        but corrected to be single-state.
         """
-        new_states_list = []
 
-        # We must iterate over the raw Python states and actions
-        # actions.tensor is shape [batch_size, 1], so we .squeeze() or [:, 0]
-        raw_actions = actions.tensor[:, 0]
+        # ---
+        # --- BUG FIX (from user log) ---
+        # The 'action' passed by the sampler's non-vectorized loop
+        # is an `Actions` object (e.g., of shape [1, 1]).
+        # We must extract the Python integer value.
+        try:
+            action_int = action.tensor.item()
+        except AttributeError:
+            # Fallback if it's already an int (e.g., from test_causet.py)
+            action_int = int(action)
+        except Exception:
+            # Broader fallback
+            action_int = int(action)
+        # ---
+        # ---
 
-        for i in range(len(states.states_list)):
-            state = states.states_list[i]
-            action = raw_actions[i].item() # Get the Python int for the action
+        # `state` is a Python tuple
+        n, edges, partial_v = state
 
-            # ---
-            # This is your original, single-state step logic
-            # ---
-            n, edges, partial_v = state
-            factor_idx = len(partial_v)
-            num_factors = self.get_num_factors(state)
-            is_done = False
+        # ---
+        # --- THIS IS FIX #2 ---
+        # We must get num_factors *after* 'n' is unpacked,
+        # as it relies on the get_num_factors() fix.
+        num_factors = self.get_num_factors(state)
+        factor_idx = len(partial_v)
+        # ---
 
-            if factor_idx == num_factors:
-                # Stage is complete. 'action' is the 0 forced by the agent.
+        is_done = False
+        action_taken = action_int # Use the int
+
+        if factor_idx == num_factors:
+            # --- This is a STAGE TRANSITION step ---
+
+            if n == self.max_nodes:
+                # We are at the terminal state (e.g., n=15).
+                # The agent forced action 0.
+                # The only valid step is to the sink.
+                new_state = self.eos_action
+                is_done = True
+                action_taken = self.eos_action
+
+            else:
+                # We are at a non-terminal state (e.g., n=14).
+                # We are transitioning to the next stage (n=15).
                 new_n = n + 1
                 new_node = n
 
                 new_edges_list = list(edges)
-                for j, v_j in enumerate(partial_v): # Use the state's partial_v
+                for j, v_j in enumerate(partial_v):
                     if v_j == 1:
                         new_edges_list.append((j, new_node))
                 new_edges = tuple(new_edges_list)
 
                 new_state = (new_n, new_edges, ())
-
-                if new_n == self.max_nodes:
-                    is_done = True
-
+                is_done = False # Not done yet, just arrived at n=15
+                action_taken = self.eos_action
                 self._graph_cache = {}
 
-                # In a batched step, we don't return 'eos_action' or 'done'.
-                # The sampler handles 'done' separately via 'is_sink_state'.
-                # We just return the new state.
-                new_states_list.append(new_state)
+        else:
+            # --- This is a FACTOR DECISION step ---
+            # 'action_int' is the factor decision (0 or 1).
+            new_partial_v = partial_v + (action_int,) # <--- USE THE INT
+            new_state = (n, edges, new_partial_v)
+            is_done = False
+            # action_taken is already correct (0 or 1)
 
-            else:
-                # This is a FACTOR DECISION step.
-                # 'action' is the factor decision (0 or 1).
-                new_partial_v = partial_v + (action,)
-                new_state = (n, edges, new_partial_v)
-                new_states_list.append(new_state)
-            # ---
-            # End of original single-state logic
-            # ---
+        return new_state, action_taken, is_done
 
-        # Return a new batch of ObjectStates
-        return self.States(new_states_list, device=self._device)
     # ---
     # --- END OF FIX ---
     # ---
@@ -310,6 +360,16 @@ class CausalSetEnv(FactorEnv):
         # -----------
 
         for state in raw_states:
+            # ---
+            # --- FIX for Log Reward ---
+            # We must check for the sink state (-1) in case
+            # the `trajectories.last_states` includes it, although
+            # docs say it shouldn't. This is a safety check.
+            if not isinstance(state, tuple):
+                rewards.append(-1e10) # Penalize sink or invalid states
+                continue
+            # ---
+
             n, edges, _ = state
             # --- FIX ---
             # Corrected typo: self.max_models -> self.max_nodes

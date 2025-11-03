@@ -30,7 +30,8 @@ class CausalSetRewardProxy:
         # as we are now using a true solver.
 
         print(f"Initialized RewardProxy with type: {self.reward_type}")
-        print(f"Target dimension {self.target_dim} corresponds to C2/C1^2 ratio: {self.target_ratio:.4f}")
+        if self.reward_type == 'mmd':
+            print(f"Target dimension {self.target_dim} corresponds to C2/C1^2 ratio: {self.target_ratio:.4f}")
 
     def get_energy(self, g: nx.DiGraph) -> float:
         """
@@ -72,9 +73,9 @@ class CausalSetRewardProxy:
             # If ratio is outside the range produced by [1.01, 10.0],
             # root_scalar will raise a ValueError.
             # Return the closest boundary.
-            if ratio > self.target_ratio: # d > 4
+            if ratio > self._mmd_ratio_func_single(10.0): # d > 10
                 return 10.0
-            else: # d < 4
+            else: # d < 1.01
                 return 1.01
         except Exception:
             # Catch other potential errors

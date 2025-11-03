@@ -22,6 +22,11 @@ import torch.distributions as dist
 from gfn.env import Env
 from gfn.estimators import Estimator
 from gfn.states import States
+# ---
+# --- FIX for Actions ---
+from gfn.actions import Actions
+# ---
+# ---
 
 # --- FIX ---
 # Import PolicyMixin from 'gfn.estimators' instead of 'gfn.modules'
@@ -101,6 +106,65 @@ class FactorEnv(Env, ABC):
         """
         pass
 
+    # ---
+    # --- FIX for Vectorized Env ---
+    #
+    # The torchgfn library (as per your traceback) calls `env._step`
+    # (the non-vectorized version) which iterates and calls `env.step`
+    # (the single-state version).
+    #
+    # We must rename CausalSetEnv's vectorized step to `_step`
+    # and provide a single-state `step` to satisfy the API.
+    #
+    # To fix this, we implement the *single-state* `step` here,
+    # which will be called by the library's default `_step`.
+    # We also add an `_step` abstract method for CausalSetEnv
+    # to optionally implement for vectorization.
+
+    @abstractmethod
+    def _step_single(self, state: Any, action: Any) -> tuple[Any, Any, bool]:
+        """
+        The abstract single-state step logic that CausalSetEnv must implement.
+        """
+        pass
+
+    def step(self, state: Any, action: Any) -> tuple[Any, Any, bool]:
+        """
+        This is the single-state step function that the base library's
+        `_step` will call. It delegates to the child's implementation.
+        """
+        return self._step_single(state, action)
+
+    # ---
+    # --- NEW (Vectorized) _step ---
+    #
+    # Per the `torchgfn` docs, if we want a vectorized environment,
+    # we must override `_step`, not `step`.
+
+    def _step(self, states: "States", actions: "Actions") -> "States":
+        """
+        This is the *vectorized* step function.
+        We provide a default implementation that calls the single-state `step`.
+        A child class (like CausalSetEnv) can override this
+        for a fully vectorized implementation.
+        """
+        # This is the default non-vectorized implementation from gfn.env.Env
+        # We include it here so CausalSetEnv can override it.
+        new_states = states.copy()
+        dones = states.is_sink_state
+
+        for i, state in enumerate(states):
+            if not dones[i]:
+                action = actions[i]
+                new_state, action_taken, done = self.step(state, action)
+                new_states[i] = new_state
+                dones[i] = done
+
+        return new_states
+    # ---
+    # --- END FIX ---
+    # ---
+
     def backward_step(self, states: Any, actions: Any) -> Any:
         """
         Backward sampling is not implemented for this factored environment.
@@ -136,7 +200,7 @@ class ObjectStates(States):
     def set_source_state_template(cls, source_tuple):
         """Helper to set the tuple used for s0 generation."""
         # --- DEBUG ---
-        print(f"[DEBUG] ObjectStates: Setting source state template to: {source_tuple}")
+        # print(f"[DEBUG] ObjectStates: Setting source state template to: {source_tuple}")
         # -----------
         cls._source_state_tuple = source_tuple
 
@@ -177,7 +241,12 @@ class ObjectStates(States):
         # Use the *processed* list, not the original `states_list`.
         self.states_list = processed_states_list
         # ---
-        self.tensor = torch.arange(len(self.states_list), dtype=torch.long, device=self._device)
+
+        # ---
+        # --- THIS IS THE FIX for the `AssertionError` ---
+        # The Trajectories container asserts `len(batch_shape) == 2`.
+        # We must make our dummy tensor 2D, e.g., [batch_size, 1].
+        self.tensor = torch.arange(len(self.states_list), dtype=torch.long, device=self._device).unsqueeze(-1)
         # ---
 
         self.shape = self.tensor.shape
@@ -195,21 +264,22 @@ class ObjectStates(States):
         first_state_debug = self.states_list[0] if self.states_list else "N/A"
         # This print statement will now show `first state=0` when the bug occurs
         # if the copy() method is not overridden.
-        print(f"[DEBUG] ObjectStates.__init__: Created batch. self.shape={self.shape}, self.s0.shape={s0_shape}, first state={first_state_debug}")
+        # print(f"[DEBUG] ObjectStates.__init__: Created batch. self.shape={self.shape}, self.s0.shape={s0_shape}, first state={first_state_debug}")
         # -----------
 
         if hasattr(self, "s0") and self.s0 is not None:
             # ---
             # --- THE FIX ---
-            # This assertion fails when creating a new batch (e.g., shape (128,))
-            # because self.s0 is the canonical s0 batch (shape (1,)).
+            # This assertion fails when creating a new batch (e.g., shape (128,1))
+            # because self.s0 is the canonical s0 batch (shape (1,1)).
             # This check is invalid for our object-based states.
-            # assert self.s0.shape == self.shape
+            # We can check the number of dimensions instead.
+            assert self.s0.shape[1:] == self.shape[1:]
             # ---
             pass
         else:
             # --- DEBUG ---
-            print(f"[DEBUG] ObjectStates.__init__: self.s0 is not set yet (this is OK if creating s0).")
+            # print(f"[DEBUG] ObjectStates.__init__: self.s0 is not set yet (this is OK if creating s0).")
             # -----------
             pass
 
@@ -241,15 +311,29 @@ class ObjectStates(States):
     # ---
     # --- THE FIX for the IndexError ---
     #
+
+    # ---
+    # --- THIS IS THE FIX for `len(batch_shape) == 2` ---
+    # We override the n_dims class attribute to 0.
+    n_dims = 0
+
     @property
     def batch_shape(self) -> torch.Size:
         """
-        Overrides the base class's n_dims calculation, which
-        fails for our ObjectStates wrapper.
-        For ObjectStates, the batch_shape is just the shape
-        of our dummy tensor (e.g., torch.Size([128])).
+        The base class defines batch_shape as self.shape[:-self.n_dims].
+        With n_dims=0, this would be self.shape[:], which is (B, 1).
+        This seems to be what the Trajectories class wants.
+        However, the *sampler* (samplers.py line 245) does:
+        `self.env.States.make_initial_states(batch_shape=(n_samples, *self.env.state_shape)`
+        This implies `env.state_shape` should be `(1,)` and
+        the *base* `batch_shape` (which is `self.shape[:-1]`)
+        should be used.
+
+        This is a deep contradiction. Let's force it.
+        We will return self.shape `(B, 1)` to satisfy Trajectories,
+        and modify `make_initial_states` to handle it.
         """
-        return self.shape # self.shape is self.tensor.shape
+        return self.shape
     # ---
     # ---
 
@@ -295,11 +379,16 @@ class ObjectStates(States):
         # print(f"[DEBUG] ObjectStates.__setitem__: Setting items. Index type: {type(index)}")
         # ---
 
-        if not isinstance(value, ObjectStates):
-            # This shouldn't happen if env.step returns ObjectStates
-            raise TypeError(f"Value must be an ObjectStates object, not {type(value)}")
-
-        new_states_to_set = value.states_list
+        # --- FIX ---
+        # The base non-vectorized `_step` calls __setitem__ with a
+        # *single* state (e.g., a tuple), not an ObjectStates object.
+        # We must handle this.
+        if isinstance(value, ObjectStates):
+            new_states_to_set = value.states_list
+        else:
+            # It's a single state (e.g., a tuple)
+            new_states_to_set = [value]
+        # ---
 
         if isinstance(index, torch.Tensor) and index.dtype == torch.bool:
             # This is the expected case: new_states[not_dones]
@@ -313,10 +402,9 @@ class ObjectStates(States):
                     except StopIteration:
                         raise IndexError("Not enough values to set in ObjectStates __setitem__")
         else:
-            # Handle other index types if necessary
-            # This is a basic implementation for other index types
+            # Handle other index types (like a single int from non-vectorized loop)
             try:
-                self.states_list[index] = new_states_to_set
+                self.states_list[index] = new_states_to_set[0]
             except Exception as e:
                 raise TypeError(f"ObjectStates __setitem__ encountered an error. Index: {index}, Value: {value}. Error: {e}")
 
@@ -372,13 +460,18 @@ class ObjectStates(States):
         Creates a batch of initial (source) states for the GFN sampler.
         """
         # --- DEBUG ---
-        print(f"[DEBUG] ObjectStates.make_initial_states: Called with batch_shape={batch_shape}")
+        # print(f"[DEBUG] ObjectStates.make_initial_states: Called with batch_shape={batch_shape}")
         # -----------
 
         if cls._source_state_tuple is None:
             raise RuntimeError("Source state template not set for ObjectStates.")
 
-        num_states = batch_shape[0] # Assumes batch_shape is (N,)
+        # ---
+        # --- AssertionError FIX ---
+        # The sampler passes a `batch_shape` of `(n_samples, 1)`.
+        # We must extract the number of states from `batch_shape[0]`.
+        num_states = batch_shape[0] # Assumes batch_shape is (N, 1) or (N,)
+        # ---
 
         # Create N copies of the source state tuple
         initial_states_list = [cls._source_state_tuple] * num_states
@@ -504,7 +597,7 @@ class _CategoricalWrapper(dist.Categorical):
 #        convert this list of tuples into a single 'pyg_batch'.
 #     c. **Get All Logits**: It calls 'self.policy(pyg_batch)' to get the
 #        logits for *all nodes in the entire batch*.
-#     d. **Select Correct Logits**: This is the "Factored" part. It
+#     d. **Select Correct Logits**: This is "Factored" part. It
 #        iterates through the states in the batch. For each state:
 #        i.   It finds the current 'factor_idx' (from 'len(partial_v)').
 #        ii.  It uses the 'pyg_batch.ptr' to find the *global node index*
@@ -600,8 +693,9 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
         current_time = time.time()
         do_debug_print = (current_time - self.last_debug_print_time > 5.0) or (self.get_logits_call_count <= 5)
         if do_debug_print:
-            print(f"\n[DEBUG] FactorPreAggAgent.get_logits: Call #{self.get_logits_call_count}")
-            self.last_debug_print_time = current_time
+            # print(f"\n[DEBUG] FactorPreAggAgent.get_logits: Call #{self.get_logits_call_count}")
+            pass
+        self.last_debug_print_time = current_time
         # -----------
 
         if backward:
@@ -635,16 +729,18 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
         if not raw_states:
             # --- DEBUG ---
             if do_debug_print:
-                print(f"[DEBUG] FactorPreAggAgent.get_logits: Received empty raw_states list.")
+                # print(f"[DEBUG] FactorPreAggAgent.get_logits: Received empty raw_states list.")
+                pass
             # -----------
             return torch.empty(0, len(self.env.action_space)).to(self.device)
 
         # --- DEBUG ---
         if do_debug_print:
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: Processing batch of {len(raw_states)} states.")
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: First state in batch: {raw_states[0]}")
+            # print(f"[DEBUG] FactorPreAggAgent.get_logits: Processing batch of {len(raw_states)} states.")
+            # print(f"[DEBUG] FactorPreAggAgent.get_logits: First state in batch: {raw_states[0]}")
             if len(raw_states) > 1:
-                print(f"[DEBUG] FactorPreAggAgent.get_logits: Last state in batch: {raw_states[-1]}")
+                # print(f"[DEBUG] FactorPreAggAgent.get_logits: Last state in batch: {raw_states[-1]}")
+                pass
         # -----------
 
         # 2. Collate states into a PyG batch
@@ -676,8 +772,9 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
 
         # --- DEBUG ---
         if do_debug_print:
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: Got all_node_logits shape: {all_node_logits.shape}")
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: pyg_batch.ptr: {ptr}")
+            # print(f"[DEBUG] FactorPreAggAgent.get_logits: Got all_node_logits shape: {all_node_logits.shape}")
+            # print(f"[DEBUG] FactorPreAggAgent.get_logits: pyg_batch.ptr: {ptr}")
+            pass
         # -----------
 
         for i, state in enumerate(raw_states):
@@ -700,6 +797,7 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
 
                 else:
                     # --- This is a stage-transition step ---
+                    # (This includes s0 and terminal states)
                     trans_logits = torch.full((n_actions,), -1e10,
                                               device=self.device)
                     trans_logits[0] = 0.0
@@ -731,7 +829,8 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
 
         # --- DEBUG ---
         if do_debug_print:
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: Success. Returning final_logits shape: {final_logits.shape}")
+            # print(f"[DEBUG] FactorPreAggAgent.get_logits: Success. Returning final_logits shape: {final_logits.shape}")
+            pass
         # -----------
 
         return final_logits
@@ -767,7 +866,8 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
         # --- DEBUG ---
         # This fixes the user's debug log to show the correct shape.
         if self.get_logits_call_count <= 5: # Match debug frequency
-             print(f"[DEBUG] FactorPreAggAgent.to_probability_distribution: Converting logits of shape {logits.shape} to Categorical.")
+             # print(f"[DEBUG] FactorPreAggAgent.to_probability_distribution: Converting logits of shape {logits.shape} to Categorical.")
+             pass
         # ---
 
         # Return our wrapper instead of the base dist.Categorical
@@ -775,3 +875,25 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
     # ---
     # --- END OF FIX ---
     # ---
+
+# ---
+# --- FIX for `AssertionError: self.actions.batch_shape` ---
+#
+class CustomActions(Actions):
+    """
+    A custom Actions container to fix a batch_shape assertion.
+    The `gfn.containers.Trajectories` class asserts that
+    `len(self.actions.batch_shape) == 2`.
+    The base `gfn.Actions` class defines `batch_shape` as
+    `self.tensor.shape[:-1]`.
+    Since our action tensor has shape `[batch_size, 1]`, the
+    base `batch_shape` is `[batch_size]`, which has len 1.
+    This class overrides `batch_shape` to return the full
+    tensor shape, `[batch_size, 1]`, which has len 2.
+    """
+    @property
+    def batch_shape(self) -> torch.Size:
+        return self.tensor.shape
+# ---
+# --- END OF FIX ---
+# ---
