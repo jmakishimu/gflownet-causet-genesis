@@ -893,7 +893,7 @@ class CustomActions(Actions):
     """
     @property
     def batch_shape(self) -> torch.Size:
-        return self.tensor.shape
+        return self.tensor.shape[:-1]
 # ---
 # --- END OF FIX ---
 # ---

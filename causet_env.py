@@ -8,12 +8,7 @@ from typing import List, Any
 # --- FIX ---
 # Import the base 'States' (for type hints) and our new 'ObjectStates'
 from gfn.states import States
-# ---
-# --- NEW FIX ---
-# Import CustomActions as well
-from custom_gfn import FactorEnv, ObjectStates, CustomActions
-# ---
-# ---
+from custom_gfn import FactorEnv, ObjectStates
 # --- FIX for 'Actions' AttributeError & ImportError ---
 # Import the base 'Actions' class from gfn.actions
 from gfn.actions import Actions
@@ -60,11 +55,8 @@ class CausalSetEnv(FactorEnv):
         # --- FIX for 'Actions' AttributeError ---
         # We must manually set the attributes that gfn.Env.__init__
         # would normally set for the sampler to work.
-        # ---
-        # --- NEW FIX: Use CustomActions ---
-        self.Actions = CustomActions
-        # ---
-        # ---
+        # We use the base 'Actions' class.
+        self.Actions = Actions
 
         # n_actions = len(self.action_space). The sampler/policy
         # deals with [0, 1]. The eos_action (-1) is handled by
@@ -188,16 +180,8 @@ class CausalSetEnv(FactorEnv):
         return self.action_space
 
     def get_num_factors(self, state):
-        """
-        The number of factors (decisions) in this stage is n.
-
-        --- THIS IS FIX #1 ---
-        When we *are* at the max_nodes state (e.g., n=15),
-        the number of factors is 0, signalling a terminal state.
-        """
+        """ The number of factors (decisions) in this stage is n. """
         n, _, _ = state
-        if n == self.max_nodes:
-            return 0 # This is a terminal state, no more factors.
         return n
 
     def get_mask(self, state, stage, factor_idx):
@@ -274,52 +258,38 @@ class CausalSetEnv(FactorEnv):
 
         # `state` is a Python tuple
         n, edges, partial_v = state
-
-        # ---
-        # --- THIS IS FIX #2 ---
-        # We must get num_factors *after* 'n' is unpacked,
-        # as it relies on the get_num_factors() fix.
-        num_factors = self.get_num_factors(state)
         factor_idx = len(partial_v)
-        # ---
-
+        num_factors = self.get_num_factors(state)
         is_done = False
         action_taken = action_int # Use the int
 
         if factor_idx == num_factors:
-            # --- This is a STAGE TRANSITION step ---
+            # Stage is complete. 'action_int' is the 0 forced by the agent.
+            new_n = n + 1
+            new_node = n
 
-            if n == self.max_nodes:
-                # We are at the terminal state (e.g., n=15).
-                # The agent forced action 0.
-                # The only valid step is to the sink.
-                new_state = self.eos_action
+            new_edges_list = list(edges)
+            for j, v_j in enumerate(partial_v): # Use the state's partial_v
+                if v_j == 1:
+                    new_edges_list.append((j, new_node))
+            new_edges = tuple(new_edges_list)
+
+            new_state = (new_n, new_edges, ())
+
+            if new_n == self.max_nodes:
                 is_done = True
-                action_taken = self.eos_action
 
-            else:
-                # We are at a non-terminal state (e.g., n=14).
-                # We are transitioning to the next stage (n=15).
-                new_n = n + 1
-                new_node = n
+            self._graph_cache = {}
 
-                new_edges_list = list(edges)
-                for j, v_j in enumerate(partial_v):
-                    if v_j == 1:
-                        new_edges_list.append((j, new_node))
-                new_edges = tuple(new_edges_list)
-
-                new_state = (new_n, new_edges, ())
-                is_done = False # Not done yet, just arrived at n=15
-                action_taken = self.eos_action
-                self._graph_cache = {}
+            # The single-state step must return the `eos_action`
+            # to signal a non-factor step.
+            action_taken = self.eos_action
 
         else:
-            # --- This is a FACTOR DECISION step ---
+            # This is a FACTOR DECISION step.
             # 'action_int' is the factor decision (0 or 1).
             new_partial_v = partial_v + (action_int,) # <--- USE THE INT
             new_state = (n, edges, new_partial_v)
-            is_done = False
             # action_taken is already correct (0 or 1)
 
         return new_state, action_taken, is_done
@@ -360,16 +330,6 @@ class CausalSetEnv(FactorEnv):
         # -----------
 
         for state in raw_states:
-            # ---
-            # --- FIX for Log Reward ---
-            # We must check for the sink state (-1) in case
-            # the `trajectories.last_states` includes it, although
-            # docs say it shouldn't. This is a safety check.
-            if not isinstance(state, tuple):
-                rewards.append(-1e10) # Penalize sink or invalid states
-                continue
-            # ---
-
             n, edges, _ = state
             # --- FIX ---
             # Corrected typo: self.max_models -> self.max_nodes
