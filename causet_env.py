@@ -8,43 +8,40 @@ from typing import Tuple
 from gfn.env import Env
 from gfn.states import States
 
-
 class CausalSetEnv(Env):
-    """
-    Implements the Causal Set Environment using proper torchgfn integration.
-
-    State representation: A tensor [n, edge_bits...] where:
-    - n: current number of nodes (0 to max_nodes)
-    - edge_bits: flattened upper triangular adjacency matrix
-
-    Action: An integer representing which edge to add/toggle, or EOS action
-    """
+    # ... (docstring remains the same) ...
     def __init__(self, max_nodes: int, proxy, device='cpu'):
         self.max_nodes = max_nodes
         self.proxy = proxy
         self._device = torch.device(device)
 
         # Calculate state dimension
-        # We need to store: current n + all possible edges
         self.max_edges = (max_nodes * (max_nodes - 1)) // 2
         self.state_dim = 1 + self.max_edges  # [n, edge_0, edge_1, ...]
 
-        # Action space: for each stage n, we can add edges from previous nodes
-        # Action encoding: choose which node (0 to n-1) to connect, or EOS
-        # We'll use a simpler sequential approach: at stage n, decide n binary actions
-        self.action_dim = max_nodes  # Maximum actions per stage
+        # Action space: an integer representing which node to connect to, or EOS
+        self.action_dim = self.max_edges + 1
 
-        # Initialize s0: [0, 0, 0, ...] - no nodes, no edges
-        s0_tensor = torch.zeros((1, self.state_dim), dtype=torch.float, device=self._device)
+        # Define dummy and exit actions (as integers first)
+        _dummy_action_int = self.action_dim
+        _exit_action_int = self.action_dim
 
-        # Initialize sf: marked by n = max_nodes + 1 (terminal marker)
-        sf_tensor = torch.full((1, self.state_dim), -1.0, dtype=torch.float, device=self._device)
+        # Initialize s0 and sf tensors (they should be 1D tensors representing a single state)
+        s0_tensor = torch.zeros((self.state_dim,), dtype=torch.float, device=self._device)
+        sf_tensor = torch.full((self.state_dim,), -1.0, dtype=torch.float, device=self._device)
 
-        # Call parent init with proper state shape
+        # Convert dummy/exit actions to tensors BEFORE passing to super().__init__
+        dummy_action_tensor = torch.tensor([_dummy_action_int], dtype=torch.long, device=self._device)
+        exit_action_tensor = torch.tensor([_exit_action_int], dtype=torch.long, device=self._device)
+
+        # Call parent init with all required arguments as tensors
         super().__init__(
             s0=s0_tensor,
             sf=sf_tensor,
-            device=self._device,
+            state_shape=(self.state_dim,), # Pass the shape of a single state
+            action_shape=(1,),             # Actions are single-element tensors
+            dummy_action=dummy_action_tensor,
+            exit_action=exit_action_tensor,
         )
 
         # Store preprocessor for state features
@@ -64,6 +61,11 @@ class CausalSetEnv(Env):
 
     def _decode_state(self, state_tensor: torch.Tensor) -> Tuple[int, torch.Tensor]:
         """Extract current n and edge adjacency from state tensor"""
+
+        # Ensure input is treated as a 1D tensor (handle potential batch dimension if it exists)
+        if state_tensor.dim() > 1:
+             state_tensor = state_tensor.squeeze(0)
+
         n = int(state_tensor[0].item())
         edges = state_tensor[1:]
         return n, edges

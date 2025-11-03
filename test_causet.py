@@ -25,12 +25,14 @@ class TestCausalSetEnv(unittest.TestCase):
         self.proxy = MockProxy()
         self.env = CausalSetEnv(max_nodes=4, proxy=self.proxy, device='cpu')
 
-    def test_env_initialization(self):
-        print("\nTesting Environment Initialization...")
+    # In test_causet.py
 
-        # Check s0 shape
-        self.assertEqual(self.env.s0.shape[0], 1)  # Batch size 1
-        self.assertEqual(self.env.s0.shape[1], self.env.state_dim)
+    def test_env_initialization(self):
+        # ...
+        # self.assertEqual(self.env.s0.shape[0], 1)  # <-- Remove/Comment this line
+        self.assertEqual(self.env.s0.ndim, 1) # s0 should be a 1D tensor
+        self.assertEqual(self.env.s0.shape[0], self.env.state_dim) # Shape should match state_dim
+
 
         # Check s0 is all zeros (no nodes, no edges)
         self.assertTrue(torch.allclose(self.env.s0, torch.zeros_like(self.env.s0)))
@@ -92,7 +94,7 @@ class TestCausalSetEnv(unittest.TestCase):
         state_tensor = torch.zeros(1, self.env.state_dim)
         state_tensor[0, 0] = 2
 
-        states = States(state_tensor)
+        states = States(state_tensor, state_shape=self.env.state_shape)
         rewards = self.env.log_reward(states)
 
         # Incomplete states should have very low reward
@@ -112,7 +114,7 @@ class TestCausalSetEnv(unittest.TestCase):
         # Add some edges (doesn't matter for mock proxy)
         state_tensor[0, 1] = 1.0  # Edge 0->1
 
-        states = States(state_tensor)
+        states = States(state_tensor, state_shape=self.env.state_shape)
         rewards = self.env.log_reward(states)
 
         # Complete states should have finite reward
