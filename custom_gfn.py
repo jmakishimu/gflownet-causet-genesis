@@ -196,6 +196,28 @@ class ObjectStates(States):
     # We will store the *template* source state here once the environment defines it.
     _source_state_tuple = None
 
+    # ---
+    # --- FIX for "weird" sampler bug ---
+    #
+    # These class attributes will be "patched" by the CausalSetEnv
+    # instance so that `is_sink_state` can correctly identify
+    # terminal graph states.
+    env_max_nodes = None
+    sf_value = -1
+
+    @classmethod
+    def patch_env_config(cls, env_max_nodes: int, sf_value: Any):
+        """
+        Called by the environment to give this class
+        access to environment-specific terminal conditions.
+        """
+        # print(f"[DEBUG] ObjectStates: Patching config. max_nodes={env_max_nodes}, sf_value={sf_value}")
+        cls.env_max_nodes = env_max_nodes
+        cls.sf_value = sf_value
+    # ---
+    # --- END OF FIX ---
+    # ---
+
     @classmethod
     def set_source_state_template(cls, source_tuple):
         """Helper to set the tuple used for s0 generation."""
@@ -338,29 +360,43 @@ class ObjectStates(States):
     # ---
 
     # ---
-    # --- FIX for 'is_sink_state' NotImplementedError ---
+    # --- FIX for 'is_sink_state' (The "weird" sampler bug) ---
     #
     @property
     def is_sink_state(self) -> torch.Tensor:
         """
         Checks which states in the batch are the sink state.
         This property is required by the GFN sampler.
-        """
-        try:
-            # Get the canonical sink state value (e.g., -1)
-            # This was set in CausalSetEnv.__init__
-            sink_val = self.__class__.sf.states_list[0]
-        except Exception as e:
-             # Fallback in case sf is not set, though it should be.
-             print(f"[DEBUG] ObjectStates.is_sink_state: CRITICAL WARNING: self.__class__.sf not found or not set. Error: {e}. Falling back to -1.")
-             sink_val = -1
 
-        # Compare each state in the batch to the sink value
-        is_sink = [s == sink_val for s in self.states_list]
+        This implementation correctly identifies *both* the
+        canonical sink state (e.g., -1) and environment-specific
+        terminal states (e.g., graphs with n == max_nodes).
+        """
+        if self.__class__.env_max_nodes is None:
+            raise RuntimeError(
+                "ObjectStates.env_max_nodes was not patched by the environment. "
+                "Ensure CausalSetEnv.patch_env_config() is called."
+            )
+
+        # Get the patched values from the class
+        max_n = self.__class__.env_max_nodes
+        sink_val = self.__class__.sf_value
+
+        is_sink = []
+        for s in self.states_list:
+            if s == sink_val:
+                # Case 1: It's the canonical sink state (e.g., -1)
+                is_sink.append(True)
+            elif isinstance(s, tuple) and len(s) == 3:
+                # Case 2: It's a graph state. Check if terminal.
+                n = s[0] # Get node count
+                is_sink.append(n == max_n)
+            else:
+                # Case 3: It's some other state (e.g., s0)
+                is_sink.append(False)
 
         # --- DEVICE FIX ---
         # Return as a boolean tensor on the correct device.
-        # self.tensor.device is now the correct device (e.g., cuda:0)
         return torch.tensor(is_sink, dtype=torch.bool, device=self.tensor.device)
         # ---
     # ---
@@ -564,6 +600,9 @@ class _CategoricalWrapper(dist.Categorical):
     A wrapper for the Categorical distribution to fix a shape mismatch.
     The default 'dist.sample()' returns [batch_size], but the 'gfn.Actions'
     class expects [batch_size, 1]. This wrapper fixes that.
+
+    (Note: This wrapper inherits __init__ from dist.Categorical, so
+    it correctly accepts 'probs=...' or 'logits=...'.)
     """
     def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
         # Call the original sample method
@@ -611,26 +650,25 @@ class _CategoricalWrapper(dist.Categorical):
 #        completed state '(n, e, (a_0,...,a_{n-1}))'. For these, it
 #        returns fixed logits forcing "action 0", which triggers the
 #        'step' method's stage-transition logic.
+# 5.  **Epsilon-Greedy**: This is implemented in `to_probability_distribution`.
+#     It mixes the `softmax(logits)` from the policy with a uniform
+#     distribution over valid actions, weighted by `self.epsilon`.
 # ---
 
 # --- FIX ---
 # Inherit from PolicyMixin to provide sampler methods like 'init_context'.
 class FactorPreAggAgent(Estimator, PolicyMixin):
-# -----------
     """
-    Implements the Factored Pre-aggregation Agent.
-
-    This agent is compatible with 'TBGFlowNet'. It coordinates the
-    'FactorEnv' and 'FactorPreAggPolicy', using the provided
-    'collate_fn' and 'num_factors_fn' to correctly select and
-    mask logits for each factor decision.
+    Implements the Factored Pre-aggregation Agent with exploration.
     """
     def __init__(self,
                  policy: FactorPreAggPolicy,
                  env: FactorEnv,
                  collate_fn: Callable,
                  num_factors_fn: Callable,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 temperature: float = 1.0,
+                 epsilon: float = 0.1):
         """
         Args:
             policy: The 'FactorPreAggPolicy' module holding the parameters.
@@ -639,275 +677,185 @@ class FactorPreAggAgent(Estimator, PolicyMixin):
                         (from 'train.py').
             num_factors_fn: A lambda fn 's -> s[0]' (from 'train.py').
             device: The torch device.
+            temperature: Softmax temperature for sampling.
+            epsilon: Probability of random action (epsilon-greedy).
         """
-
-        # --- FIX ---
-        # The base 'Estimator' class's default preprocessor
-        # (IdentityPreprocessor) requires 'module.input_dim'.
-        # Our agent bypasses the preprocessor by implementing
-        # 'get_logits' with a custom collate_fn.
-        # We pass 'preprocessor=None' to skip the default
-        # preprocessor logic, BUT we must still add 'input_dim'
-        # to the policy module to satisfy the assertion.
         super().__init__(module=policy, preprocessor=None)
-        # -----------
 
-        # --- FIX ---
-        # Add temperature attribute required by PolicyMixin
-        self.temperature = 1.0
-        # -----------
-
-        # This 'policy' is the nn.Module with the parameters, matching
-        # 'optim.Adam(policy.parameters())' in train.py.
-        # The base class now stores this as 'self.module'.
         self.policy = policy
-
         self.env = env
         self.collate_fn = collate_fn
         self.num_factors_fn = num_factors_fn
         self.device = torch.device(device)
 
+        # Exploration parameters
+        self.temperature = temperature
+        self.epsilon = epsilon
+        self._training_mode = True  # Track if we're in training
+
         # Ensure policy is on the correct device
         self.policy.to(self.device)
 
-        # --- DEBUG ---
+        # Debug counters
         self.get_logits_call_count = 0
         self.last_debug_print_time = 0
-        # -----------
+
+    def set_epsilon(self, epsilon: float):
+        """Update epsilon for exploration annealing."""
+        self.epsilon = epsilon
+
+    def set_temperature(self, temperature: float):
+        """Update temperature for annealing."""
+        self.temperature = temperature
 
     @property
     def expected_output_dim(self) -> int:
-        """
-        Returns the output dimension of the estimator.
-        This corresponds to the number of actions in the environment.
-        """
         return len(self.env.action_space)
 
     def get_logits(self, states: States, backward: bool = False) -> torch.Tensor:
         """
         Calculates the logits for the current factor decision for each state.
-        This method is called by 'TBGFlowNet'.
         """
-        # --- DEBUG ---
         self.get_logits_call_count += 1
         current_time = time.time()
         do_debug_print = (current_time - self.last_debug_print_time > 5.0) or (self.get_logits_call_count <= 5)
-        if do_debug_print:
-            # print(f"\n[DEBUG] FactorPreAggAgent.get_logits: Call #{self.get_logits_call_count}")
-            pass
         self.last_debug_print_time = current_time
-        # -----------
 
         if backward:
-            raise NotImplementedError(
-                "FactorPreAggAgent does not support backward sampling."
-            )
+            raise NotImplementedError("FactorPreAggAgent does not support backward sampling.")
 
-        # 1. Extract raw state tuples from the States container.
-        #    Because we implemented __getitem__ in ObjectStates, 'states'
-        #    will always be an ObjectStates object, so states.states_list
-        #    will always exist.
+        # Extract raw state tuples
         try:
             raw_states: List[tuple] = states.states_list
         except AttributeError:
-            # This block should no longer be reached, but is kept
-            # as a fallback.
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: WARNING! states object is not ObjectStates. Falling back.")
             try:
                 raw_states: List[tuple] = list(states.tensor.flat)
             except AttributeError:
                 raw_states: List[tuple] = list(states)
         except Exception as e:
-            # --- DEBUG ---
-            print(f"[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR extracting states. States object: {states}")
-            # -----------
-            raise ValueError(
-                f"FactorPreAggAgent could not extract raw states (tuples) "
-                f"from the gfn.States object. Error: {e}"
-            )
+            raise ValueError(f"FactorPreAggAgent could not extract raw states. Error: {e}")
 
         if not raw_states:
-            # --- DEBUG ---
-            if do_debug_print:
-                # print(f"[DEBUG] FactorPreAggAgent.get_logits: Received empty raw_states list.")
-                pass
-            # -----------
             return torch.empty(0, len(self.env.action_space)).to(self.device)
 
-        # --- DEBUG ---
-        if do_debug_print:
-            # print(f"[DEBUG] FactorPreAggAgent.get_logits: Processing batch of {len(raw_states)} states.")
-            # print(f"[DEBUG] FactorPreAggAgent.get_logits: First state in batch: {raw_states[0]}")
-            if len(raw_states) > 1:
-                # print(f"[DEBUG] FactorPreAggAgent.get_logits: Last state in batch: {raw_states[-1]}")
-                pass
-        # -----------
-
-        # 2. Collate states into a PyG batch
-        #    The collate_fn creates the PyG Batch, which we then
-        #    move to the 'self.device' (e.g., 'cuda').
+        # Collate states into PyG batch
         try:
             pyg_batch = self.collate_fn(raw_states).to(self.device)
         except Exception as e:
-            print(f"\n[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR in collate_fn.")
-            print(f"Error: {e}")
-            print(f"First 5 raw_states: {raw_states[:5]}")
+            print(f"\n[ERROR] collate_fn failed: {e}")
             raise e
 
-        # 3. Get logits for all nodes in the batch from the policy
-        #    Shape: [total_nodes, num_actions]
+        # Get logits from policy
         try:
             all_node_logits = self.policy(pyg_batch)
         except Exception as e:
-            print(f"\n[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR in self.policy(pyg_batch).")
-            print(f"Error: {e}")
-            print(f"pyg_batch.x shape: {pyg_batch.x.shape}, device: {pyg_batch.x.device}")
-            print(f"pyg_batch.edge_index shape: {pyg_batch.edge_index.shape}, device: {pyg_batch.edge_index.device}")
+            print(f"\n[ERROR] policy forward failed: {e}")
             raise e
 
-        # 4. Select the logits for the *current* factor of each state
+        # Apply temperature scaling
+        all_node_logits = all_node_logits / self.temperature
+
+        # Select logits for current factor
         selected_logits: List[torch.Tensor] = []
         ptr = pyg_batch.ptr.to(self.device)
         n_actions = len(self.env.action_space)
 
-        # --- DEBUG ---
-        if do_debug_print:
-            # print(f"[DEBUG] FactorPreAggAgent.get_logits: Got all_node_logits shape: {all_node_logits.shape}")
-            # print(f"[DEBUG] FactorPreAggAgent.get_logits: pyg_batch.ptr: {ptr}")
-            pass
-        # -----------
-
         for i, state in enumerate(raw_states):
             try:
-                # --- UNPACK STATE FIRST ---
                 n, edges, partial_v = state
-
-                num_factors = self.num_factors_fn(state) # e.g., 'n'
+                num_factors = self.num_factors_fn(state)
                 factor_idx = len(partial_v)
 
-                # ---
-                # --- THIS IS THE CRITICAL FIX ---
-                #
-                # First, check if the state is *already* terminal.
-                # (self.env is CausalSetEnv, which has max_nodes)
+                # Terminal state check
                 if n == self.env.max_nodes:
-                    # This is a terminal state, e.g., (15, ...).
-                    # Force a "stage transition" (action 0). The sampler
-                    # will see this and correctly terminate the trajectory.
-                    trans_logits = torch.full((n_actions,), -1e10,
-                                              device=self.device)
+                    trans_logits = torch.full((n_actions,), -1e10, device=self.device)
                     trans_logits[0] = 0.0
                     selected_logits.append(trans_logits)
 
                 elif factor_idx < num_factors:
-                    # --- This is a factor-decision step ---
-                    stage = n # Use n as stage
+                    # Factor decision step
+                    stage = n
                     node_start_idx = ptr[i]
                     global_node_idx = node_start_idx + factor_idx
                     logits = all_node_logits[global_node_idx]
+
+                    # Apply mask
                     mask = self.env.get_mask(state, stage, factor_idx).to(self.device)
                     logits = logits.masked_fill(~mask, -1e10)
+
                     selected_logits.append(logits)
 
                 else:
-                    # --- This is a stage-transition step ---
-                    # (This includes s0 and non-terminal states < max_nodes)
-                    trans_logits = torch.full((n_actions,), -1e10,
-                                              device=self.device)
+                    # Stage transition step
+                    trans_logits = torch.full((n_actions,), -1e10, device=self.device)
                     trans_logits[0] = 0.0
                     selected_logits.append(trans_logits)
 
             except Exception as e:
-                print(f"\n[DEBUG] FactorPreAggAgent.get_logits: CRITICAL ERROR during logit selection loop.")
+                print(f"\n[ERROR] Logit selection failed for state {i}: {state}")
                 print(f"Error: {e}")
-                print(f"Failing state (i={i}): {state}")
-                # --- DEBUG ---
-                # This error (`cannot unpack non-iterable int object`)
-                # would happen *here* if `raw_states` was `[0, 1, 2, ...]`.
-                # But the traceback says the error is in `env.step`.
-                # This confirms the `states` object *passed to get_logits*
-                # is correct, but the one *passed to env.step* is not.
-                # ---
-                print(f"State: {state}")
-                if 'num_factors' in locals():
-                    print(f"num_factors: {num_factors}, factor_idx: {factor_idx}")
-                if 'node_start_idx' in locals():
-                    print(f"ptr: {ptr}, node_start_idx: {node_start_idx}, global_node_idx: {global_node_idx}")
-                # ---
-                print(f"all_node_logits shape: {all_node_logits.shape}")
                 raise e
 
-        # Stack the selected logits for the batch
-        # Shape: [batch_size, num_actions]
         final_logits = torch.stack(selected_logits)
-
-        # --- DEBUG ---
-        if do_debug_print:
-            # print(f"[DEBUG] FactorPreAggAgent.get_logits: Success. Returning final_logits shape: {final_logits.shape}")
-            pass
-        # -----------
-
         return final_logits
 
     def forward(self, states: States, backward: bool = False) -> torch.Tensor:
-        """
-        This is the 'nn.Module.forward' method, which 'Estimator.get_logits'
-        would normally call. We override 'get_logits' directly, but
-        implement 'forward' to be safe.
-        """
         return self.get_logits(states, backward)
 
-    # ---
-    # --- FIX for 'AttributeError' (logits.dim()) ---
-    #
     def to_probability_distribution(self, states: States, context: torch.Tensor) -> dist.Distribution:
         """
-        Overrides the 'PolicyMixin' method to correctly create the distribution.
-
-        Args:
-            states: The 'ObjectStates' object (which we ignore here).
-            context: The logits tensor (e.g., shape [128, 2]) returned
-                     by 'self.init_context', which itself just returns
-                     the 'estimator_outputs' from 'self.forward()'.
-
-        Returns:
-            A _CategoricalWrapper object.
+        Creates distribution with epsilon-greedy exploration during training.
         """
-        # The 'context' is the logits tensor returned by our 'get_logits'
-        # method, via the compute_dist -> self.forward -> init_context pipeline.
         logits = context
 
-        # --- DEBUG ---
-        # This fixes the user's debug log to show the correct shape.
-        if self.get_logits_call_count <= 5: # Match debug frequency
-             # print(f"[DEBUG] FactorPreAggAgent.to_probability_distribution: Converting logits of shape {logits.shape} to Categorical.")
-             pass
-        # ---
+        # During training, add epsilon-greedy exploration
+        if self._training_mode and self.epsilon > 0:
+            batch_size = logits.shape[0]
 
-        # Return our wrapper instead of the base dist.Categorical
-        return _CategoricalWrapper(logits=logits)
-    # ---
-    # --- END OF FIX ---
-    # ---
+            # Create uniform logits for exploration
+            uniform_logits = torch.zeros_like(logits)
 
+            # Mix policy and uniform based on epsilon
+            # With probability epsilon, use uniform; otherwise use policy
+            mixed_logits = torch.log(
+                self.epsilon * torch.softmax(uniform_logits, dim=-1) +
+                (1 - self.epsilon) * torch.softmax(logits, dim=-1)
+            )
+
+            return _CategoricalWrapper(logits=mixed_logits)
+        else:
+            return _CategoricalWrapper(logits=logits)
+
+    def train(self, mode: bool = True):
+        """Override train mode to track exploration."""
+        self._training_mode = mode
+        self.policy.train(mode)
+        return self
+
+    def eval(self):
+        """Override eval mode to disable exploration."""
+        self._training_mode = False
+        self.policy.eval()
+        return self
 # ---
 # --- FIX for `AssertionError: self.actions.batch_shape` ---
 #
 class CustomActions(Actions):
     """
     A custom Actions container to fix a batch_shape assertion.
-    The `gfn.containers.Trajectories` class asserts that
-    `len(self.actions.batch_shape) == 2`.
-    The base `gfn.Actions` class defines `batch_shape` as
-    `self.tensor.shape[:-1]`.
-    Since our action tensor has shape `[batch_size, 1]`, the
-    base `batch_shape` is `[batch_size]`, which has len 1.
-    This class overrides `batch_shape` to return the full
-    tensor shape, `[batch_size, 1]`, which has len 2.
+    The Trajectories container requires batch_shape to be 2D.
     """
     @property
     def batch_shape(self) -> torch.Size:
-        return self.tensor.shape[:-1]
+        # The tensor shape is [batch_size, action_dim] where action_dim = 1
+        # We want batch_shape to be [batch_size, 1] (2D)
+        # The base class returns self.tensor.shape[:-1] which gives [batch_size] (1D)
+        # We need to keep the full 2D shape for the first two dimensions
+        if len(self.tensor.shape) >= 2:
+            return self.tensor.shape[:2]  # Return [batch_size, 1] or [batch_size, seq_len]
+        else:
+            # Fallback: make it 2D
+            return torch.Size([self.tensor.shape[0], 1])
 # ---
 # --- END OF FIX ---
 # ---
