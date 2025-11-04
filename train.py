@@ -1,6 +1,6 @@
 #
-# gflownet-causet-genesis/train_optimized.py
-# OPTIMIZED VERSION - Faster training for larger N
+# gflownet-causet-genesis/train.py
+# OPTIMIZED VERSION - Fixed warnings, faster training
 #
 import torch
 import torch.nn as nn
@@ -13,8 +13,6 @@ import argparse
 import os
 from tqdm import tqdm
 import time
-import math
-from torch.cuda.amp import autocast, GradScaler
 
 from gfn.gflownet.trajectory_balance import TBGFlowNet
 from gfn.estimators import DiscretePolicyEstimator
@@ -25,25 +23,18 @@ from causet_reward import CausalSetRewardProxy
 
 
 class OptimizedCausetPolicy(nn.Module):
-    """Optimized policy network with:
-    - Layer normalization for stability
-    - Residual connections for deeper networks
-    - Efficient forward pass
-    """
+    """Optimized policy network with layer norm and residual connections"""
     def __init__(self, state_dim: int, hidden_dim: int, action_dim: int, n_layers: int = 3):
         super().__init__()
         self.input_dim = state_dim
 
-        # Input projection
         self.input_proj = nn.Linear(state_dim, hidden_dim)
         self.input_ln = nn.LayerNorm(hidden_dim)
 
-        # Residual blocks
         self.blocks = nn.ModuleList([
             ResidualBlock(hidden_dim) for _ in range(n_layers)
         ])
 
-        # Output head
         self.output = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -73,25 +64,21 @@ class ResidualBlock(nn.Module):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--N", type=int, default=10,
-                       help="Max causet size")
+    parser.add_argument("--N", type=int, default=10)
     parser.add_argument("--reward_type", type=str, default="bd", choices=["bd", "mmd"])
     parser.add_argument("--beta", type=float, default=1.0)
 
     # Training
     parser.add_argument("--num_steps", type=int, default=10_000)
-    parser.add_argument("--batch_size", type=int, default=128,
-                       help="Larger batch = better GPU utilization")
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--n_layers", type=int, default=3)
 
     # Optimization
-    parser.add_argument("--use_amp", action="store_true",
-                       help="Use automatic mixed precision (faster on modern GPUs)")
+    parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--eval_every", type=int, default=100,
-                       help="Eval frequency (reduce for speed)")
+    parser.add_argument("--eval_every", type=int, default=100)
 
     # Device
     parser.add_argument("--device", type=str,
@@ -115,7 +102,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Auto-generate run name
     if args.run_name is None:
         args.run_name = f"n{args.N}_{args.reward_type}_b{args.batch_size}_h{args.hidden_dim}"
 
@@ -133,7 +119,7 @@ def main():
 
     # Initialize environment
     print("Initializing environment...")
-    proxy = CausalSetRewardProxy(reward_type=args.reward_type)
+    proxy = CausalSetRewardProxy(reward_type=args.reward_type, device=args.device)
     env = CausalSetEnv(max_nodes=args.N, proxy=proxy, device=args.device)
 
     print(f"State dim: {env.state_dim}, Action dim: {env.n_actions}")
@@ -171,7 +157,6 @@ def main():
     pf.to(args.device)
     pb.to(args.device)
 
-    # Count parameters
     n_params_pf = sum(p.numel() for p in pf.parameters())
     n_params_pb = sum(p.numel() for p in pb.parameters())
     print(f"PF parameters: {n_params_pf:,}")
@@ -193,8 +178,8 @@ def main():
         optimizer, T_max=args.num_steps, eta_min=args.lr * 0.1
     )
 
-    # AMP scaler for mixed precision
-    scaler = GradScaler() if args.use_amp else None
+    # FIXED: Use torch.amp instead of torch.cuda.amp
+    scaler = torch.amp.GradScaler('cuda') if args.use_amp and args.device == 'cuda' else None
 
     # Create sampler
     sampler = Sampler(estimator=pf)
@@ -219,8 +204,8 @@ def main():
         pb.train()
         optimizer.zero_grad()
 
-        # Sample trajectories
-        with autocast(enabled=args.use_amp):
+        # FIXED: Use torch.amp.autocast instead of torch.cuda.amp.autocast
+        with torch.amp.autocast('cuda', enabled=args.use_amp and args.device == 'cuda'):
             trajectories = sampler.sample_trajectories(
                 env=env,
                 n=args.batch_size,
@@ -228,7 +213,6 @@ def main():
                 epsilon=current_epsilon
             )
 
-            # Calculate loss
             loss = gflownet.loss(env, trajectories)
 
         if not loss.isfinite():
@@ -236,20 +220,21 @@ def main():
             continue
 
         # Backward pass with optional AMP
-        if args.use_amp:
+        if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(pf.parameters(), args.grad_clip)
             torch.nn.utils.clip_grad_norm_(pb.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(pf.parameters(), args.grad_clip)
             torch.nn.utils.clip_grad_norm_(pb.parameters(), args.grad_clip)
             optimizer.step()
+            scheduler.step()
 
-        scheduler.step()
 
         # Update progress bar
         pbar.set_postfix({
@@ -257,39 +242,50 @@ def main():
             'lr': f'{scheduler.get_last_lr()[0]:.2e}'
         })
 
-        # Evaluation
+        # OPTIMIZED EVALUATION
         if step % args.eval_every == 0 or step == args.num_steps - 1:
             with torch.no_grad():
                 all_states = trajectories.states.tensor
 
                 if all_states.dim() == 3:
-                    batch_size = all_states.shape[1]
+                    batch_size_actual = all_states.shape[1]
 
-                    # Extract terminal states
-                    energies = []
-                    log_rewards = []
-                    valid_count = 0
-
-                    for b in range(batch_size):
+                    # Extract final states more efficiently
+                    final_states_list = []
+                    for b in range(batch_size_actual):
                         traj = all_states[:, b, :]
                         non_sink = traj[:, 0] != -1
                         if non_sink.any():
-                            final_state = traj[non_sink][-1]
-                            n = int(final_state[0].item())
+                            final_states_list.append(traj[non_sink][-1])
 
-                            if n == args.N:
-                                g = env._state_to_graph(final_state)
-                                energy = proxy.get_energy(g)
+                    if final_states_list:
+                        # Stack all final states
+                        final_states_batch = torch.stack(final_states_list)
 
-                                if energy < 1e9:
-                                    energies.append(energy)
-                                    # Use log reward directly
-                                    log_rewards.append(-args.beta * energy)
-                                    valid_count += 1
+                        # BATCHED energy computation (MUCH FASTER)
+                        if args.reward_type == 'bd':
+                            energies = proxy.get_bd_energy_batched(
+                                final_states_batch,
+                                args.N
+                            ).cpu().numpy()
+                        else:
+                            # Sequential for MMD (ablation)
+                            energies = []
+                            for state in final_states_batch:
+                                g = env._state_to_graph(state)
+                                energies.append(proxy.get_energy(g))
+                            energies = np.array(energies)
 
-                    avg_energy = np.mean(energies) if energies else 1e9
-                    avg_log_reward = np.mean(log_rewards) if log_rewards else -1e9
-                    valid_frac = valid_count / batch_size
+                        # Filter valid energies
+                        valid_energies = energies[energies < 1e9]
+
+                        avg_energy = np.mean(valid_energies) if len(valid_energies) > 0 else 1e9
+                        avg_log_reward = -args.beta * avg_energy if len(valid_energies) > 0 else -1e9
+                        valid_frac = len(valid_energies) / batch_size_actual
+                    else:
+                        avg_energy = 1e9
+                        avg_log_reward = -1e9
+                        valid_frac = 0.0
 
                     log_data.append({
                         'step': step,
@@ -330,7 +326,6 @@ def main():
     final_ensemble = []
 
     with torch.no_grad():
-        # Sample in batches for speed
         n_batches = 1000 // args.batch_size + 1
         for _ in tqdm(range(n_batches), desc="Sampling"):
             trajectories = sampler.sample_trajectories(
@@ -340,7 +335,6 @@ def main():
                 epsilon=0.0
             )
 
-            # Extract graphs
             all_states = trajectories.states.tensor
             if all_states.dim() == 3:
                 for b in range(all_states.shape[1]):
@@ -352,7 +346,7 @@ def main():
                             g = env._state_to_graph(final_state)
                             final_ensemble.append(g)
 
-    final_ensemble = final_ensemble[:1000]  # Keep exactly 1000
+    final_ensemble = final_ensemble[:1000]
 
     with open(os.path.join(run_dir, "final_ensemble.pkl"), 'wb') as f:
         pickle.dump(final_ensemble, f)

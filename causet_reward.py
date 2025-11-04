@@ -1,44 +1,37 @@
 #
 # gflownet-causet-genesis/causet_reward.py
+# OPTIMIZED VERSION - Batched GPU operations
 #
-import math
+import torch
 import networkx as nx
 import numpy as np
 import random
-from scipy.optimize import root_scalar # (Fix #1 Applied) Import root_scalar
+from scipy.optimize import root_scalar
 from scipy.special import gamma
+
 
 class CausalSetRewardProxy:
     """
-    Implements the Reward Proxy (Phase 3).
-
-    - Fix #3: Correct Benincasa-Dowker matrix product (C @ C)
-    - Fix #5: (MODIFIED) Robust MMD solver using scipy.optimize.root_scalar
-    - MMD Flaw Fix: Correctly handles sparse/1D causets by falling
-                    back to an average ratio of 0.0 (not target_ratio).
+    Reward Proxy with batched GPU operations for BD action.
+    MMD kept for ablation studies (CPU-only).
     """
-    def __init__(self, reward_type: str, target_dim: float = 4.0):
+    def __init__(self, reward_type: str, target_dim: float = 4.0, device='cuda'):
         if reward_type not in ['mmd', 'bd']:
             raise ValueError("reward_type must be 'mmd' or 'bd'")
         self.reward_type = reward_type
         self.target_dim = target_dim
+        self.device = device
 
-        # Pre-calculate the target ratio for d=4
-        self.target_ratio = self._mmd_ratio_func_single(self.target_dim)
-
-        # (Fix #1 Applied) Remove pre-calculated mmd_func and ranges,
-        # as we are now using a true solver.
-
-        print(f"Initialized RewardProxy with type: {self.reward_type}")
-        if self.reward_type == 'mmd':
+        if reward_type == 'mmd':
+            self.target_ratio = self._mmd_ratio_func_single(self.target_dim)
+            print(f"Initialized RewardProxy with type: {self.reward_type} (CPU-only)")
             print(f"Target dimension {self.target_dim} corresponds to C2/C1^2 ratio: {self.target_ratio:.4f}")
+        else:
+            print(f"Initialized RewardProxy with type: {self.reward_type} (GPU-accelerated)")
 
     def get_energy(self, g: nx.DiGraph) -> float:
-        """
-        Returns the energy (e.g., Action S_BD or (MMD-4)^2) for the GFlowNet.
-        Low energy = high reward.
-        """
-        if g.number_of_nodes() < 2: # Trivial graph
+        """Legacy interface for single graph (for analysis)"""
+        if g.number_of_nodes() < 2:
             return 1e10
 
         if self.reward_type == 'mmd':
@@ -46,170 +39,238 @@ class CausalSetRewardProxy:
         elif self.reward_type == 'bd':
             return self.get_bd_energy(g)
 
-    # --- Reward A: Myrheim-Meyer Dimension (MMD) ---
+    # --- BATCHED BD ACTION (GPU-ACCELERATED) ---
+
+    def get_bd_energy_batched(self, state_tensors: torch.Tensor, max_nodes: int) -> torch.Tensor:
+        """
+        Compute BD action for a batch of states using pure PyTorch.
+
+        Args:
+            state_tensors: [batch_size, state_dim] - state vectors
+            max_nodes: maximum number of nodes
+
+        Returns:
+            energies: [batch_size] - BD action values
+        """
+        batch_size = state_tensors.shape[0]
+        device = state_tensors.device
+
+        # Extract n values
+        n_values = state_tensors[:, 0].long()  # [batch_size]
+
+        # Initialize energies with high penalty for incomplete causets
+        energies = torch.full((batch_size,), 1e10, device=device, dtype=torch.float32)
+
+        # Only compute for complete causets (n == max_nodes)
+        valid_mask = (n_values == max_nodes)
+
+        if not valid_mask.any():
+            return energies
+
+        # Process only valid states
+        valid_states = state_tensors[valid_mask]  # [n_valid, state_dim]
+        n_valid = valid_mask.sum().item()
+
+        # Extract adjacency matrices from state vectors
+        # State format: [n, edge_0_1, edge_0_2, ..., edge_{n-2}_{n-1}]
+        max_edges = (max_nodes * (max_nodes - 1)) // 2
+
+        # Build adjacency matrices efficiently
+        adj_matrices = self._build_adjacency_matrices_batched(
+            valid_states[:, 1:1+max_edges], max_nodes
+        )  # [n_valid, max_nodes, max_nodes]
+
+        # Compute transitive closure (causal matrices)
+        causal_matrices = self._transitive_closure_batched(adj_matrices)
+
+        # Make reflexive
+        eye = torch.eye(max_nodes, device=device, dtype=torch.bool)
+        causal_matrices = causal_matrices | eye.unsqueeze(0)
+
+        # Compute BD action for each valid state
+        bd_actions = self._compute_bd_action_batched(
+            causal_matrices.float(), max_nodes
+        )  # [n_valid]
+
+        # Fill in results
+        energies[valid_mask] = bd_actions
+
+        return energies
+
+    def _build_adjacency_matrices_batched(self, edge_vectors: torch.Tensor,
+                                         max_nodes: int) -> torch.Tensor:
+        """
+        Convert edge vectors to adjacency matrices.
+
+        Args:
+            edge_vectors: [batch_size, max_edges] - binary edge indicators
+            max_nodes: number of nodes
+
+        Returns:
+            adj_matrices: [batch_size, max_nodes, max_nodes] - adjacency matrices
+        """
+        batch_size = edge_vectors.shape[0]
+        device = edge_vectors.device
+
+        # Initialize adjacency matrices
+        adj = torch.zeros(batch_size, max_nodes, max_nodes,
+                         device=device, dtype=torch.bool)
+
+        # Map flat edge index to (i, j) pairs
+        edge_idx = 0
+        for i in range(max_nodes):
+            for j in range(i + 1, max_nodes):
+                if edge_idx < edge_vectors.shape[1]:
+                    adj[:, i, j] = edge_vectors[:, edge_idx] > 0.5
+                edge_idx += 1
+
+        return adj
+
+    def _transitive_closure_batched(self, adj_matrices: torch.Tensor) -> torch.Tensor:
+        """
+        Compute transitive closure using Warshall's algorithm (batched).
+
+        Args:
+            adj_matrices: [batch_size, n, n] - adjacency matrices
+
+        Returns:
+            closures: [batch_size, n, n] - transitive closures
+        """
+        batch_size, n, _ = adj_matrices.shape
+
+        # Start with adjacency matrix
+        tc = adj_matrices.clone()
+
+        # Warshall's algorithm
+        for k in range(n):
+            # tc[i,j] |= tc[i,k] & tc[k,j]
+            tc = tc | (tc[:, :, k:k+1] & tc[:, k:k+1, :])
+
+        return tc
+
+    def _compute_bd_action_batched(self, causal_matrices: torch.Tensor,
+                                   n: int) -> torch.Tensor:
+        """
+        Compute BD action from causal matrices (batched).
+
+        Args:
+            causal_matrices: [batch_size, n, n] - reflexive causal matrices
+            n: number of nodes
+
+        Returns:
+            actions: [batch_size] - BD action values
+        """
+        batch_size = causal_matrices.shape[0]
+
+        # Compute interval sizes: C @ C
+        # interval_sizes[b, i, j] = number of elements in I[i,j]
+        interval_sizes = torch.matmul(causal_matrices, causal_matrices)  # [batch_size, n, n]
+
+        # Flatten to count occurrences
+        interval_sizes_flat = interval_sizes.reshape(batch_size, -1)  # [batch_size, n*n]
+
+        # Count N_k for each batch element
+        # We need counts for sizes 2, 3, 4, 5 (corresponding to k=0,1,2,3)
+        N_0 = (interval_sizes_flat == 2).sum(dim=1).float()  # [batch_size]
+        N_1 = (interval_sizes_flat == 3).sum(dim=1).float()
+        N_2 = (interval_sizes_flat == 4).sum(dim=1).float()
+        N_3 = (interval_sizes_flat == 5).sum(dim=1).float()
+
+        # S_BD = n - N_0 + 9*N_1 - 16*N_2 + 8*N_3
+        actions = n - N_0 + 9*N_1 - 16*N_2 + 8*N_3
+
+        return actions
+
+    # --- LEGACY SINGLE-GRAPH BD ACTION ---
+
+    def get_bd_energy(self, g: nx.DiGraph) -> float:
+        """Legacy BD action for single graph (used in analysis)"""
+        n = g.number_of_nodes()
+        if n < 4:
+            return 1e10
+
+        tc_g = nx.transitive_closure(g, reflexive=True)
+        node_list = sorted(g.nodes())
+        C_matrix = nx.adjacency_matrix(tc_g, nodelist=node_list).toarray().astype(np.int32)
+
+        interval_sizes = C_matrix @ C_matrix
+        counts = np.bincount(interval_sizes.ravel())
+
+        N_0 = counts[2] if len(counts) > 2 else 0
+        N_1 = counts[3] if len(counts) > 3 else 0
+        N_2 = counts[4] if len(counts) > 4 else 0
+        N_3 = counts[5] if len(counts) > 5 else 0
+
+        action_value = float(n - N_0 + (9 * N_1) - (16 * N_2) + (8 * N_3))
+        return action_value
+
+    # --- MMD (CPU-ONLY, FOR ABLATION) ---
 
     def _mmd_ratio_func_single(self, d):
-        """ (Fix #5) The theoretical C2/C1^2 ratio for a given d. """
-        if d <= 1: return 0.0 # Ratio is 0 for d=1
+        if d <= 1: return 0.0
         return (gamma(d + 1) * gamma(d / 2)) / (4 * gamma(d) * gamma(1.5 * d))
 
     def solve_mmd_from_ratio(self, ratio):
-        """
-        (Fix #1 Applied) Robustly solves for d given a C2/C1^2 ratio
-        using scipy.optimize.root_scalar.
-        """
         if ratio <= 0 or not np.isfinite(ratio):
-            return 1.01 # Return a value near 1D
+            return 1.01
 
         try:
-            # Define the function to solve: f(d) = 0
             f = lambda d: self._mmd_ratio_func_single(d) - ratio
-
-            # Solve for d in the bracket [1.01, 10.0]
-            # bisect is robust and guaranteed to stay in bounds.
             sol = root_scalar(f, bracket=[1.01, 10.0], method='bisect')
             return sol.root
         except ValueError:
-            # If ratio is outside the range produced by [1.01, 10.0],
-            # root_scalar will raise a ValueError.
-            # Return the closest boundary.
-            if ratio > self._mmd_ratio_func_single(10.0): # d > 10
+            if ratio > self._mmd_ratio_func_single(10.0):
                 return 10.0
-            else: # d < 1.01
+            else:
                 return 1.01
         except Exception:
-            # Catch other potential errors
-            return 1.01 # Fallback
+            return 1.01
 
     def calculate_avg_mmd_ratio(self, g: nx.DiGraph, num_samples=200):
-        """
-        (MMD Flaw Fix) Calculates the average C2/C1^2 ratio.
-        Includes C2=0 cases and falls back to 0.0 if no valid
-        C1>=2 intervals are found.
-        """
         nodes = list(g.nodes)
         n = len(nodes)
         if n < 2:
             return 0.0
 
-        # --- MMD BUG FIX ---
-        # We need *both* closures.
-        # Inclusive: To check if x and y are related at all.
-        # Exclusive: To find the set of nodes *between* x and y.
         tc_inclusive = nx.transitive_closure(g, reflexive=True)
         tc_exclusive = nx.transitive_closure(g, reflexive=False)
-        # ---
         ratios = []
 
         for _ in range(num_samples):
             x, y = random.sample(nodes, 2)
 
-            if tc_inclusive.has_edge(y, x): x, y = y, x # Ensure x < y
-            elif not tc_inclusive.has_edge(x, y): continue # Spacelike
+            if tc_inclusive.has_edge(y, x): x, y = y, x
+            elif not tc_inclusive.has_edge(x, y): continue
 
-            # --- MMD BUG FIX ---
-            # Vectorized interval check (EXCLUSIVE)
-            # z must be a SUCCESSOR of x (x < z)
-            # z must be a PREDECESSOR of y (z < y)
             interval_nodes = {
                 z for z in nodes
                 if tc_exclusive.has_edge(x, z) and tc_exclusive.has_edge(z, y)
             }
-            # ---
             C_1 = len(interval_nodes)
 
-            # --- MMD BUG FIX ---
-            # The original 'C_1 < 2' was for an *inclusive* interval.
-            # For an *exclusive* interval, C_1=0 and C_1=1 are both invalid
-            # for forming a C_2 ratio.
-            if C_1 < 2: continue # Not a valid interval, skip sample
-            # ---
+            if C_1 < 2: continue
 
             C_2 = 0
             interval_list = list(interval_nodes)
             for i in range(C_1):
                 for j in range(i + 1, C_1):
                     u, v = interval_list[i], interval_list[j]
-                    # Use *inclusive* TC here to check if u and v are related
                     if tc_inclusive.has_edge(u, v) or tc_inclusive.has_edge(v, u):
                         C_2 += 1
 
-            # Add the ratio, *including* C_2 = 0 cases
             ratios.append(C_2 / (C_1**2))
 
-        # (THE FIX) If 'ratios' is empty (e.g., a pure antichain where
-        # no x < y pairs were found, or no C_1 >= 2 intervals found),
-        # return 0.0.
         return np.mean(ratios) if ratios else 0.0
 
     def get_mmd_energy(self, g: nx.DiGraph) -> float:
-        """
-        Energy = (avg_MMD(c) - 4.0)^2
-
-        This now correctly calculates energy based on the average ratio,
-        preventing the 1D-chain-gets-zero-energy flaw.
-        """
         try:
-            # 1. Get the average ratio. This will be 0.0 for antichains.
             avg_ratio = self.calculate_avg_mmd_ratio(g)
-
-            # 2. Solve for the dimension *once* based on the average ratio.
             avg_mmd = self.solve_mmd_from_ratio(avg_ratio)
-
-            # 3. Calculate energy.
-            # If avg_mmd = 1.01 (from ratio 0.0), energy will be high:
-            # (1.01 - 4.0)^2 >> 0
             energy = (avg_mmd - self.target_dim)**2
             return energy
-        except Exception as e:
-            return 1e10 # High energy if calc fails
-
-    def calculate_avg_mmd(self, g: nx.DiGraph, num_samples=200):
-        """
-        Helper function for analysis.py.
-        Returns the calculated average MMD (not the energy).
-        """
-        avg_ratio = self.calculate_avg_mmd_ratio(g, num_samples)
-        return self.solve_mmd_from_ratio(avg_ratio)
-
-    # --- Reward B: Benincasa-Dowker (BD) Action ---
-
-    def get_bd_energy(self, g: nx.DiGraph) -> float:
-        """
-        Reward B: The "Parsimonious" SOTA (Benincasa-Dowker Action)
-        Energy = S_BD[c]
-
-        (Fix #3) This implementation is vectorized with the *correct*
-        matrix multiplication (C @ C) to find causal intervals.
-        """
-        n = g.number_of_nodes()
-        if n < 4: # BD action is trivial for < 4 nodes
+        except Exception:
             return 1e10
 
-        # --- ATTRIBUTE ERROR FIX ---
-        # 1. Get Causal Matrix C (reflexive)
-        # 'transitive_closure_matrix' is deprecated.
-        # The new method is to compute the closure, then get the matrix.
-        tc_g = nx.transitive_closure(g, reflexive=True)
-        # Ensure node order is [0, 1, ..., n-1] for matrix ops
-        node_list = sorted(g.nodes())
-        C_matrix = nx.adjacency_matrix(tc_g, nodelist=node_list).toarray().astype(np.int32)
-        # ---
-
-        # 2. Compute all N^2 inclusive interval sizes |I[i, j]|
-        # (Fix #3) The (i, j) entry of (C @ C) is sum_k C_ik * C_kj.
-        interval_sizes = C_matrix @ C_matrix
-
-        # 3. INTRINSIC PART: Count the N_k
-        counts = np.bincount(interval_sizes.ravel())
-
-        # 4. EXTRINSIC PART: Apply 4D coefficients
-        N_0 = counts[2] if len(counts) > 2 else 0 # k=0 -> size k+2 = 2
-        N_1 = counts[3] if len(counts) > 3 else 0 # k=1 -> size k+2 = 3
-        N_2 = counts[4] if len(counts) > 4 else 0 # k=2 -> size k+2 = 4
-        N_3 = counts[5] if len(counts) > 5 else 0 # k=3 -> size k+2 = 5
-
-        # S_4D_action = n - N_0 + 9*N_1 - 16*N_2 + 8*N_3
-        action_value = float(n - N_0 + (9 * N_1) - (16 * N_2) + (8 * N_3))
-
-        return action_value
+    def calculate_avg_mmd(self, g: nx.DiGraph, num_samples=200):
+        avg_ratio = self.calculate_avg_mmd_ratio(g, num_samples)
+        return self.solve_mmd_from_ratio(avg_ratio)
