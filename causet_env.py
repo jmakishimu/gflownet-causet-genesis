@@ -1,14 +1,6 @@
 #
 # gflownet-causet-genesis/causet_env.py
-#
-# --- THIS FILE IS CORRECTED ---
-#
-# Fixes applied:
-# 1. Decoupled GFlowNet 'exit_action' from the environment's 'add-node' action.
-# 2. 'is_action_valid' returns valid.all().
-# 3. Implemented _calculate_backward_masks.
-# 4. CRITICAL FIX: _calculate_forward_masks and is_action_valid
-#    now handle the sink state (n < 0) to prevent -inf logprobs.
+# CORRECTED VERSION - Fixes -inf loss issue
 #
 import torch
 import networkx as nx
@@ -28,15 +20,14 @@ class CausalSetEnv(Env):
 
         # Action space:
         # 0 ... (max_nodes * 2 - 1): Connection decisions
-        # (max_nodes * 2) or (self.n_actions - 2): "Add-node" action
-        # (max_nodes * 2 + 1) or (self.n_actions - 1): GFlowNet "exit_action"
+        # (max_nodes * 2): "Add-node" action
+        # (max_nodes * 2 + 1): GFlowNet "exit_action"
         self.n_actions = max_nodes * 2 + 2
 
         s0_tensor = torch.zeros((self.state_dim,), dtype=torch.float, device=self._device)
         sf_tensor = torch.full((self.state_dim,), -1.0, dtype=torch.float, device=self._device)
 
         dummy_action_tensor = torch.tensor([self.n_actions], dtype=torch.long, device=self._device)
-        # The true GFlowNet exit action is the LAST action
         exit_action_tensor = torch.tensor([self.n_actions - 1], dtype=torch.long, device=self._device)
 
         super().__init__(
@@ -45,12 +36,10 @@ class CausalSetEnv(Env):
             state_shape=(self.state_dim,),
             action_shape=(1,),
             dummy_action=dummy_action_tensor,
-            exit_action=exit_action_tensor, # Pass the correct exit action
+            exit_action=exit_action_tensor,
         )
 
         self.preprocessor = None
-
-        # Store reference to custom States class
         self.States = self.make_States_class()
 
     def make_States_class(self) -> type[States]:
@@ -65,20 +54,14 @@ class CausalSetEnv(Env):
             sf = env.sf
 
             def __init__(self, tensor: torch.Tensor):
-                # Ensure tensor has correct shape
-                # States expects tensor of shape (batch_size, *state_shape)
                 if tensor.dim() == 1:
-                    # Single state - add batch dimension
                     tensor = tensor.unsqueeze(0)
 
-                # States.__init__ only takes tensor and infers batch_shape from it
                 super().__init__(tensor)
 
-                # Initialize masks - will be set by update_masks
                 self.forward_masks = None
                 self.backward_masks = None
 
-                # Immediately update masks after creation
                 env.update_masks(self)
 
             def make_random_states_tensor(self, batch_shape: tuple) -> torch.Tensor:
@@ -88,19 +71,13 @@ class CausalSetEnv(Env):
         return CausalSetStates
 
     def reset(self, batch_shape: tuple = (1,), random: bool = False):
-        """
-        Resets the environment and returns initial states.
-        This method is called by torchgfn's Sampler.
-        """
+        """Resets the environment and returns initial states."""
         if random:
             states_tensor = self.make_random_states_tensor(batch_shape)
         else:
-            # Start from s0
             states_tensor = self.s0.repeat(*batch_shape, 1)
 
-        # Use our custom States class (it will add batch dimension if needed)
         states = self.States(states_tensor)
-
         return states
 
     def make_random_states_tensor(self, batch_shape: tuple[int, ...]) -> torch.Tensor:
@@ -109,25 +86,26 @@ class CausalSetEnv(Env):
 
     def update_masks(self, states: States) -> None:
         """
-        CRITICAL: Updates forward_masks and backward_masks on the states object.
+        Updates forward_masks and backward_masks on the states object.
         This is required by torchgfn for discrete environments.
         """
         states.forward_masks = self._calculate_forward_masks(states)
         states.backward_masks = self._calculate_backward_masks(states)
 
     def _calculate_forward_masks(self, states: States) -> torch.Tensor:
-        """Computes a boolean mask of valid forward actions for a batch of states."""
-        # Get the batch size
+        """
+        Computes a boolean mask of valid forward actions for a batch of states.
+
+        CRITICAL: Must handle sink state (n < 0) to prevent -inf in forward policy.
+        """
         if states.batch_shape:
             batch_size = states.batch_shape[0]
         else:
             batch_size = 1
 
-        # Use new action space size
         masks = torch.zeros((batch_size, self.n_actions), dtype=torch.bool, device=self._device)
 
         for i in range(batch_size):
-            # Handle both batched and unbatched states
             if states.tensor.dim() == 1:
                 state = states.tensor
             else:
@@ -135,19 +113,16 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            # --- THIS IS THE FIX ---
-            # Handle sink state (n < 0)
+            # CRITICAL FIX #1: Handle sink state for forward policy
             if n < 0:
-                # This is the sink state s_f.
-                # The TB loss will call pb.log_prob(s_f, exit_action).
-                # To prevent -inf, we must set the mask for exit_action to True.
+                # At s_f, only the exit action should be valid
+                # This prevents -inf when pf evaluates s_f
                 masks[i, self.n_actions - 1] = True
                 continue
-            # --- END FIX ---
 
             # If we've reached max nodes, ONLY the GFN exit action is valid
             if n >= self.max_nodes:
-                masks[i, self.n_actions - 1] = True  # GFN exit action
+                masks[i, self.n_actions - 1] = True
                 continue
 
             # When n=0, we can only add the first node
@@ -166,7 +141,20 @@ class CausalSetEnv(Env):
         return masks
 
     def _calculate_backward_masks(self, states: States) -> torch.Tensor:
-        """Computes a boolean mask of valid backward actions for a batch of states."""
+        """
+        Computes a boolean mask of valid backward actions for a batch of states.
+
+        CRITICAL FIX: For trajectory balance to work, backward masks must be:
+        1. All TRUE at sink state s_f (pb can assign uniform distribution)
+        2. Valid parent actions at all other states
+
+        The key insight: torchgfn's TB loss evaluates pb at EVERY state in the
+        trajectory, including s_f. Since s_f can be reached from any terminal
+        state via exit_action, we need to allow pb to assign valid probabilities.
+
+        Solution: Set ALL backward actions to TRUE at s_f. This allows pb to
+        compute a valid (uniform) distribution, preventing -inf log probs.
+        """
         if states.batch_shape:
             batch_size = states.batch_shape[0]
         else:
@@ -183,24 +171,31 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            if n <= 0:
-                # s0 (n=0) or s_f (n=-1) have no parents.
+            # CRITICAL FIX: At s_f, allow ALL backward actions
+            if n < 0:
+                # Set all actions to True - pb will compute uniform distribution
+                # This prevents -inf log probs when TB loss evaluates pb(s_f, action)
+                masks[i, :] = True
+                continue
+
+            # s0 (n=0) has no parents in our construction
+            if n == 0:
                 continue
 
             # If n > 0:
             # Parent 1: state n-1 (via action "add-node")
-            masks[i, self.n_actions - 2] = True # "add-node" action
+            masks[i, self.n_actions - 2] = True  # "add-node" action
 
             # Parent 2: state n with different edges (via connection actions)
-            for node_idx in range(n): # Actions up to n
+            for node_idx in range(n):
                 action_no_connect = node_idx * 2
                 action_connect = node_idx * 2 + 1
 
                 if action_no_connect < (self.n_actions - 1):
-                     masks[i, action_no_connect] = True
+                    masks[i, action_no_connect] = True
 
                 if action_connect < (self.n_actions - 1):
-                     masks[i, action_connect] = True
+                    masks[i, action_connect] = True
 
         return masks
 
@@ -241,30 +236,23 @@ class CausalSetEnv(Env):
         return n, edges
 
     def step(self, states: States, actions: torch.Tensor) -> States:
-        """
-        Apply actions to states and return new states with updated masks.
-        """
-        # Extract tensor from Actions object if needed
+        """Apply actions to states and return new states with updated masks."""
         if hasattr(actions, 'tensor'):
             actions_tensor = actions.tensor
         else:
             actions_tensor = actions
 
-        # Clone states to create new states
         new_tensor = states.tensor.clone()
 
-        # Determine batch size
         if states.batch_shape:
             batch_size = states.batch_shape[0]
         else:
             batch_size = 1
 
         for i in range(batch_size):
-            # Handle sink states - if already sink, stay sink
             if states.is_sink_state is not None and states.is_sink_state[i]:
                 continue
 
-            # Get state and action
             if new_tensor.dim() == 1:
                 state = new_tensor
                 action = actions_tensor.item() if actions_tensor.dim() == 0 else actions_tensor[0].item()
@@ -274,21 +262,19 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            # If at or past terminal state, only valid action is GFN-exit
             if n >= self.max_nodes:
-                if action == self.n_actions - 1: # GFN exit action
+                if action == self.n_actions - 1:
                     if new_tensor.dim() == 1:
                         new_tensor = self.sf.clone()
                     else:
                         new_tensor[i] = self.sf.clone()
-                # Any other action is invalid, state remains unchanged (but will be masked)
                 continue
 
-            # "Add-node" action: finalize and add new node (increment n)
+            # "Add-node" action
             if action == self.n_actions - 2:
                 state[0] = n + 1
 
-            # GFN-exit action (premature): transition to sink
+            # GFN-exit action
             elif action == self.n_actions - 1:
                 if new_tensor.dim() == 1:
                     new_tensor = self.sf.clone()
@@ -304,25 +290,23 @@ class CausalSetEnv(Env):
                     if edge_idx < len(state):
                         state[edge_idx] = 1.0
 
-        # Create new States object with updated tensor using custom States class
         new_states = self.States(new_tensor)
-
         return new_states
 
     def is_action_valid(self, states: States, actions: torch.Tensor,
-                       backward: bool = False) -> torch.Tensor:
+                       backward: bool = False) -> bool:
         """
-        Check if actions are valid for given states
+        Check if actions are valid for given states.
+
+        IMPORTANT: Returns a single boolean (not a tensor) as required by torchgfn.
         """
-        # Extract tensor from Actions object if needed
         if hasattr(actions, 'tensor'):
             actions_tensor = actions.tensor
         else:
             actions_tensor = actions
 
         if backward:
-            # Return a single boolean
-            return torch.tensor(False, device=self._device)
+            return False
 
         batch_size = states.batch_shape[0] if states.batch_shape else 1
         valid = torch.ones(batch_size, dtype=torch.bool, device=self._device)
@@ -337,54 +321,49 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            # Check if action is out of bounds
             if action >= self.n_actions:
                 valid[i] = False
                 continue
 
-            # --- FIX for sink state ---
+            # Sink state: only exit action is valid
             if n < 0:
-                # s_f state. Only valid action is the exit action
                 valid[i] = (action == self.n_actions - 1)
                 continue
-            # --- END FIX ---
 
-            # If at terminal state, only GFN-exit is valid
+            # Terminal state: only exit action is valid
             if n >= self.max_nodes:
                 valid[i] = (action == self.n_actions - 1)
                 continue
 
-            # If n=0, only "add-node" is valid
+            # Initial state: only add-node is valid
             if n == 0:
                 valid[i] = (action == self.n_actions - 2)
                 continue
 
-            # If 0 < n < max_nodes:
-            # GFN-exit action is invalid
+            # Intermediate states
             if action == self.n_actions - 1:
+                # Exit action is invalid (must complete the causet first)
                 valid[i] = False
-            # "Add-node" action is valid
             elif action == self.n_actions - 2:
+                # Add-node is always valid
                 valid[i] = True
-            # Connection decisions
             else:
+                # Connection decisions
                 node_idx = action // 2
                 if node_idx >= n:
                     valid[i] = False
                 else:
-                    valid[i] = True # Both (connect/no-connect) are valid
+                    valid[i] = True
 
-        # Return .all() as a scalar boolean
-        return valid.all()
+        # Return scalar boolean as required by torchgfn
+        return valid.all().item()
 
     def backward_step(self, states: States, actions: torch.Tensor) -> States:
         """Backward sampling not implemented for causal sets"""
         raise NotImplementedError("Backward sampling not supported")
 
     def get_log_reward(self, final_states: States) -> torch.Tensor:
-        """
-        Compute log reward (negative energy) for final states.
-        """
+        """Compute log reward (negative energy) for final states."""
         batch_size = final_states.batch_shape[0] if final_states.batch_shape else 1
         rewards = []
 

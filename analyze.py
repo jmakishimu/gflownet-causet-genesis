@@ -57,26 +57,36 @@ def plot_2_reward(logs, save_path):
     """Plot reward acquisition"""
     plt.figure(figsize=(10, 6))
 
-    # Plot both energy and reward
+    # Plot both energy and log reward
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Energy
+    # Energy (should decrease)
     sns.lineplot(data=logs, x='step', y='avg_energy', ax=ax1)
-    ax1.set_title("Average Energy")
+    ax1.set_title("Average Energy (BD Action)")
     ax1.set_xlabel("Training Step")
-    ax1.set_ylabel("Energy (S_BD or (MMD-4)²)")
+    ax1.set_ylabel("Energy $S_{BD}$ (lower is better)")
+    ax1.axhline(y=0, color='red', linestyle='--', alpha=0.3, label='S_BD = 0')
+    ax1.legend()
 
-    # Reward
-    sns.lineplot(data=logs, x='step', y='avg_reward', ax=ax2)
-    ax2.set_title("Average Reward")
-    ax2.set_xlabel("Training Step")
-    ax2.set_ylabel("Reward (exp(-β·Energy))")
+    # Log Reward (should increase)
+    if 'avg_log_reward' in logs.columns:
+        sns.lineplot(data=logs, x='step', y='avg_log_reward', ax=ax2)
+        ax2.set_title("Average Log Reward")
+        ax2.set_xlabel("Training Step")
+        ax2.set_ylabel("Log Reward $-\\beta S_{BD}$ (higher is better)")
+    elif 'avg_reward' in logs.columns:
+        # Fallback to old column name
+        sns.lineplot(data=logs, x='step', y='avg_reward', ax=ax2)
+        ax2.set_title("Average Reward (WARNING: May be unstable)")
+        ax2.set_xlabel("Training Step")
+        ax2.set_ylabel("Reward")
+        ax2.set_yscale('log')
 
     plt.tight_layout()
     plt.savefig(os.path.join(save_path, "2_reward_acquisition.png"), dpi=150)
     plt.close()
     print("✓ Generated Plot 2: Reward Acquisition")
-
+    
 def plot_3_training_metrics(logs, save_path):
     """Plot additional training metrics"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -235,81 +245,42 @@ def plot_5_mmd_distribution(ensemble, baseline_ensemble, save_path):
     plt.axvline(x=baseline_mean, color='orange', linestyle='--', alpha=0.7,
                 label=f'Baseline Mean: {baseline_mean:.2f}')
 
-    plt.legend(fontsize=10)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_path, "5_money_shot_mmd.png"), dpi=150)
+    plt.savefig(os.path.join(save_path, "5_mmd_distribution.png"), dpi=150)
     plt.close()
 
-    print(f"✓ Generated Plot 5: The Money Shot")
+    print(f"✓ Generated Plot 5: MMD Distribution")
     print(f"  GFN Mean MMD: {gfn_mean:.2f} ± {np.std(gfn_mmds):.2f}")
     print(f"  Baseline Mean MMD: {baseline_mean:.2f} ± {np.std(baseline_mmds):.2f}")
 
-    # Calculate fraction near d=4
-    gfn_near_4 = sum(3.5 <= d <= 4.5 for d in gfn_mmds) / len(gfn_mmds)
-    baseline_near_4 = sum(3.5 <= d <= 4.5 for d in baseline_mmds) / len(baseline_mmds)
-    print(f"  GFN near d=4 [3.5, 4.5]: {gfn_near_4*100:.1f}%")
-    print(f"  Baseline near d=4: {baseline_near_4*100:.1f}%")
 
-def main_analysis():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--run_dir", type=str, required=True,
-        help="Path to experiment run directory"
-    )
-    parser.add_argument(
-        "--baseline_file", type=str, required=True,
-        help="Path to baseline ensemble pickle"
-    )
-    parser.add_argument(
-        "--reward_type", type=str, required=True, choices=["bd", "mmd"],
-        help="The reward type used in training"
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Analyze GFN training results.")
+    parser.add_argument("--run_dir", type=str, required=True,
+                        help="Path to the directory containing logs and ensemble.")
+    parser.add_argument("--baseline_file", type=str,
+                        default="baseline_random_ensemble_N10.pkl",
+                        help="Path to the random baseline ensemble pickle file.")
     args = parser.parse_args()
 
-    # Create output directory
-    plot_save_dir = os.path.join(args.run_dir, "plots")
-    os.makedirs(plot_save_dir, exist_ok=True)
+    print(f"Analyzing run directory: {args.run_dir}")
 
-    print("="*60)
-    print("CAUSAL SET GFLOWNET ANALYSIS")
-    print("="*60)
-    print(f"Run directory: {args.run_dir}")
-    print(f"Baseline file: {args.baseline_file}")
-    print(f"Reward type: {args.reward_type}")
-    print()
-
-    # Load data
-    print("Loading results...")
-    logs, ensemble = load_results(args.run_dir)
-    print(f"✓ Loaded {len(ensemble)} graphs from ensemble")
-
-    print("Loading baseline...")
-    baseline_ensemble = load_baseline(args.baseline_file)
-    print(f"✓ Loaded {len(baseline_ensemble)} baseline graphs")
-    print()
+    try:
+        logs, ensemble = load_results(args.run_dir)
+        baseline_ensemble = load_baseline(args.baseline_file)
+    except FileNotFoundError as e:
+        print(e)
+        return
 
     # Generate plots
-    print("Generating plots...")
-    print()
+    plot_1_loss(logs, args.run_dir)
+    plot_2_reward(logs, args.run_dir)
+    plot_3_training_metrics(logs, args.run_dir)
 
-    plot_1_loss(logs, plot_save_dir)
-    plot_2_reward(logs, plot_save_dir)
-    plot_3_training_metrics(logs, plot_save_dir)
+    # These plots rely on pickled graph ensembles generated by sampling scripts (not provided)
+    plot_4_bd_comparison(ensemble, baseline_ensemble, args.run_dir)
+    plot_5_mmd_distribution(ensemble, baseline_ensemble, args.run_dir)
 
-    # Reward-specific plots
-    if args.reward_type == 'bd':
-        plot_4_bd_comparison(ensemble, baseline_ensemble, plot_save_dir)
-        # Also compute MMD for emergent dimension
-        plot_5_mmd_distribution(ensemble, baseline_ensemble, plot_save_dir)
-    else:
-        # For MMD training, show how well it locked to target dimension
-        print("\nNote: For MMD training, Plot 4 shows dimension locking")
-        # Could add MMD-specific plot here
-
-    print()
-    print("="*60)
-    print(f"All plots saved to: {plot_save_dir}")
-    print("="*60)
-
-if __name__ == "__main__":
-    main_analysis()
+if __name__ == '__main__':
+    main()
