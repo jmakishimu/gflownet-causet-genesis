@@ -1,0 +1,10 @@
+--- causet_env.py
++++ causet_env.py
+@@ -292,9 +292,7 @@ class CausalSetEnv(Env):
+                 if node_idx >= n:
+                     valid[i] = False
+ 
+-        # Return .all() as a scalar boolean if being used in control flow
+-        # This is what torchgfn's _step expects
+-        return valid.all() if batch_size > 0 else torch.tensor(True, device=self._device)
++        return valid  # Return tensor of bools, one per batch element

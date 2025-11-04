@@ -9,7 +9,6 @@ from gfn.env import Env
 from gfn.states import States
 
 class CausalSetEnv(Env):
-    # ... (__init__ remains the same) ...
     def __init__(self, max_nodes: int, proxy, device='cpu'):
         self.max_nodes = max_nodes
         self.proxy = proxy
@@ -18,14 +17,15 @@ class CausalSetEnv(Env):
         self.max_edges = (max_nodes * (max_nodes - 1)) // 2
         self.state_dim = 1 + self.max_edges
 
-        _dummy_action_int = self.max_edges + 1
-        _exit_action_int = self.max_edges + 1
+        # Action space: for each existing node, we can decide to connect (2 choices)
+        # Plus one exit action
+        self.n_actions = max_nodes * 2 + 1
 
         s0_tensor = torch.zeros((self.state_dim,), dtype=torch.float, device=self._device)
         sf_tensor = torch.full((self.state_dim,), -1.0, dtype=torch.float, device=self._device)
 
-        dummy_action_tensor = torch.tensor([_dummy_action_int], dtype=torch.long, device=self._device)
-        exit_action_tensor = torch.tensor([_exit_action_int], dtype=torch.long, device=self._device)
+        dummy_action_tensor = torch.tensor([self.n_actions], dtype=torch.long, device=self._device)
+        exit_action_tensor = torch.tensor([self.n_actions - 1], dtype=torch.long, device=self._device)
 
         super().__init__(
             s0=s0_tensor,
@@ -38,34 +38,112 @@ class CausalSetEnv(Env):
 
         self.preprocessor = None
 
+        # Store reference to custom States class
+        self.States = self.make_States_class()
+
     def make_States_class(self) -> type[States]:
         """Required by torchgfn - return the States class to use"""
-        return States
+        env = self
 
+        class CausalSetStates(States):
+            """Custom States class for CausalSet environment with forward_masks support"""
 
+            state_shape = env.state_shape
+            s0 = env.s0
+            sf = env.sf
 
-    def get_forward_masks(self, states: States) -> torch.Tensor:
+            def __init__(self, tensor: torch.Tensor):
+                # Ensure tensor has correct shape
+                # States expects tensor of shape (batch_size, *state_shape)
+                if tensor.dim() == 1:
+                    # Single state - add batch dimension
+                    tensor = tensor.unsqueeze(0)
+
+                # States.__init__ only takes tensor and infers batch_shape from it
+                super().__init__(tensor)
+
+                # Initialize masks - will be set by update_masks
+                self.forward_masks = None
+                self.backward_masks = None
+
+                # Immediately update masks after creation
+                env.update_masks(self)
+
+            def make_random_states_tensor(self, batch_shape: tuple) -> torch.Tensor:
+                """Generate random state tensors"""
+                return env.s0.repeat(*batch_shape, 1)
+
+        return CausalSetStates
+
+    def reset(self, batch_shape: tuple = (1,), random: bool = False):
+        """
+        Resets the environment and returns initial states.
+        This method is called by torchgfn's Sampler.
+        """
+        if random:
+            states_tensor = self.make_random_states_tensor(batch_shape)
+        else:
+            # Start from s0
+            states_tensor = self.s0.repeat(*batch_shape, 1)
+
+        # Use our custom States class (it will add batch dimension if needed)
+        states = self.States(states_tensor)
+
+        return states
+
+    def make_random_states_tensor(self, batch_shape: tuple[int, ...]) -> torch.Tensor:
+        """Generate random states tensor for the environment"""
+        return self.s0.repeat(*batch_shape, 1)
+
+    def update_masks(self, states: States) -> None:
+        """
+        CRITICAL: Updates forward_masks and backward_masks on the states object.
+        This is required by torchgfn for discrete environments.
+        """
+        states.forward_masks = self._calculate_forward_masks(states)
+        states.backward_masks = torch.zeros(
+            (states.batch_shape[0] if states.batch_shape else 1, self.n_actions - 1),
+            dtype=torch.bool,
+            device=self._device
+        )
+
+    def _calculate_forward_masks(self, states: States) -> torch.Tensor:
         """Computes a boolean mask of valid forward actions for a batch of states."""
-        # This implementation re-uses the is_action_valid logic but adapted for masks.
-        # It's a placeholder; a more efficient, vectorized implementation would be better.
+        # Get the batch size
+        if states.batch_shape:
+            batch_size = states.batch_shape[0]
+        else:
+            batch_size = 1
 
-        batch_size = len(states)
-        masks = torch.zeros((batch_size, self.action_dim), dtype=torch.bool, device=self._device)
+        masks = torch.zeros((batch_size, self.n_actions), dtype=torch.bool, device=self._device)
 
         for i in range(batch_size):
-            state = states.tensor[i]
-            n = int(state.item())
+            # Handle both batched and unbatched states
+            if states.tensor.dim() == 1:
+                state = states.tensor
+            else:
+                state = states.tensor[i]
 
-            # If terminal state, no actions are valid (already handled by zeros init)
+            n = int(state[0].item())
+
+            # If we've reached max nodes, no actions valid (terminal state)
             if n >= self.max_nodes:
                 continue
 
-            # Action space is 0 to (n_max*2). Need to iterate through potential actions
-            for action in range(self.action_dim):
-                 # Check if the action is valid using existing logic
-                 is_valid = self.is_action_valid(states[i].unsqueeze(0), torch.tensor([action], device=self._device))
-                 if is_valid.item():
-                     masks[i, action] = True
+            # When n=0, we can only add the first node (exit action only)
+            if n == 0:
+                masks[i, self.n_actions - 1] = True  # Exit action to add first node
+                continue
+
+            # For n > 0, we have connection decisions for existing nodes
+            # Actions 0 to (n*2 - 1) are connection decisions for existing nodes
+            # Each node i in [0, n-1] has two actions: i*2 (no connect) and i*2+1 (connect)
+            for node_idx in range(n):
+                masks[i, node_idx * 2] = True      # Decision: don't connect
+                masks[i, node_idx * 2 + 1] = True  # Decision: connect
+
+            # Exit action is always valid to add next node
+            masks[i, self.n_actions - 1] = True
 
         return masks
 
@@ -74,7 +152,6 @@ class CausalSetEnv(Env):
         if i >= j:
             raise ValueError(f"Invalid edge: i={i} must be < j={j}")
         return i * self.max_nodes - (i * (i + 1)) // 2 + (j - i - 1)
-
 
     def _state_to_graph(self, state_tensor: torch.Tensor) -> nx.DiGraph:
         """Convert state tensor to networkx DiGraph"""
@@ -93,123 +170,161 @@ class CausalSetEnv(Env):
         tc = nx.transitive_closure(g)
         return tc
 
-    def _calculate_forward_masks(self, states: States) -> torch.Tensor:
-        """Computes a boolean mask of valid forward actions for a batch of states."""
-        batch_size = len(states)
-        # Initialize with zeros (invalid)
-        masks = torch.zeros((batch_size, self.action_dim), dtype=torch.bool, device=self._device)
-
-        # Vectorized calculation is complex, use loop for clarity and correctness
-        for i in range(batch_size):
-            state = states.tensor[i]
-            n = int(state.item())
-
-            if n >= self.max_nodes:
-                continue
-
-            # Valid actions: connection decisions for existing nodes (0 to n-1) and EOS (-1 which maps to index self.action_dim-1 if we map correctly)
-            # In your current setup, actions are complex (node_idx * 2 + decision) + EOS action
-            # The action map needs to be consistent.
-            # Assuming action space mapping is correct (0 to self.action_dim - 1)
-
-            # Mark all actions that correspond to valid node indices as possible
-            # We assume for N=4, action_dim=10 (9 edges + 1 EOS)
-            # This logic needs to align with how you defined the action space previously (e.g. action < 0 was EOS in step())
-
-            # Simple fix: The is_action_valid should be used here if it's correct
-
-            # For debugging, we use a broad mask:
-            # For states where n < max_nodes, any action that doesn't immediately fail should be masked True
-            # This might cause issues if invalid actions are sampled, but should pass the 'has attribute' check
-
-            # Let's assume the previous is_action_valid logic works correctly for single states:
-            for action_idx in range(self.action_dim):
-                # Check validity for single state
-                is_valid = self.is_action_valid(states[i].unsqueeze(0), torch.tensor([action_idx], device=self._device))
-                if is_valid.item():
-                    masks[i, action_idx] = True
-
-        return masks
-
     def _decode_state(self, state_tensor: torch.Tensor) -> Tuple[int, torch.Tensor]:
         """Extract current n and edge adjacency from state tensor"""
         if state_tensor.dim() > 1:
-             state_tensor = state_tensor.squeeze(0)
+            state_tensor = state_tensor.squeeze(0)
 
-        # Ensure we always access index 0 safely
         if state_tensor.dim() == 0:
-             n = int(state_tensor.item())
-             edges = torch.tensor([])
+            n = int(state_tensor.item())
+            edges = torch.tensor([], device=self._device)
         else:
-             n = int(state_tensor[0].item()) # Use index 0
-             edges = state_tensor[1:]
+            n = int(state_tensor[0].item())
+            edges = state_tensor[1:]
         return n, edges
-
-
 
     def step(self, states: States, actions: torch.Tensor) -> States:
         """
-        Apply actions to states.
+        Apply actions to states and return new states with updated masks.
+
+        Action semantics:
+        - When at state with n nodes, we're deciding connections for node n (about to be added)
+        - Action i (for i < n): if action is i*2+1, connect node i to new node n
+        - Exit action (self.n_actions - 1): finalize decisions and add node n
+
+        CRITICAL: We must NOT transition to sink until n == max_nodes
         """
-        new_states = states.clone()
+        # Extract tensor from Actions object if needed
+        if hasattr(actions, 'tensor'):
+            actions_tensor = actions.tensor
+        else:
+            actions_tensor = actions
 
-        for i in range(len(states)):
-            # ... (loop logic remains the same) ...
-            if states.is_sink_state[i]: continue
-            state = states.tensor[i]; action = actions[i].item(); n = int(state.item())
+        # Clone states to create new states
+        new_tensor = states.tensor.clone()
 
-            if n >= self.max_nodes: new_states.tensor[i] = self.sf.tensor; continue
+        # Determine batch size
+        if states.batch_shape:
+            batch_size = states.batch_shape[0]
+        else:
+            batch_size = 1
 
-            if action < 0: new_states.tensor[i] = n + 1
+        for i in range(batch_size):
+            # Handle sink states - if already sink, stay sink
+            if states.is_sink_state is not None and states.is_sink_state[i]:
+                continue
+
+            # Get state and action
+            if new_tensor.dim() == 1:
+                state = new_tensor
+                action = actions_tensor.item() if actions_tensor.dim() == 0 else actions_tensor[0].item()
             else:
-                node_idx = action // 2; decision = action % 2
-                if node_idx < n and decision == 1:
-                    edge_idx = self._get_edge_index(node_idx, n) + 1
-                    new_states.tensor[i][edge_idx] = 1.0
+                state = new_tensor[i]
+                action = actions_tensor[i].item()
 
-        # FIX: Explicitly attach the forward_masks attribute to the resulting States object
-        new_states.forward_masks = self._calculate_forward_masks(new_states)
+            n = int(state[0].item())
+
+            # CRITICAL FIX: Only transition to sink if we REACH max_nodes, not if we're AT max_nodes
+            # The terminal condition should be n >= max_nodes AFTER the action
+            if n >= self.max_nodes:
+                # Already at terminal state, transition to sink
+                if new_tensor.dim() == 1:
+                    new_tensor = self.sf.clone()
+                else:
+                    new_tensor[i] = self.sf.clone()
+                continue
+
+            # Exit action: finalize and add new node (increment n)
+            if action == self.n_actions - 1:
+                state[0] = n + 1
+                # DON'T transition to sink here - let next step handle it if n+1 == max_nodes
+            # Connection decision actions
+            elif action < self.n_actions - 1 and n > 0:
+                # When n > 0, we're deciding connections to node n
+                node_idx = action // 2
+                decision = action % 2
+
+                # Only process if node_idx is valid and decision is to connect
+                if node_idx < n and decision == 1:
+                    # Add edge from node_idx to the new node n
+                    # But we haven't incremented n yet, so the edge is for when n increments
+                    edge_idx = self._get_edge_index(node_idx, n) + 1
+                    if edge_idx < len(state):
+                        state[edge_idx] = 1.0
+
+        # Create new States object with updated tensor using custom States class
+        new_states = self.States(new_tensor)
 
         return new_states
 
     def is_action_valid(self, states: States, actions: torch.Tensor,
                        backward: bool = False) -> torch.Tensor:
-        # ... (is_action_valid implementation remains the same, used by _calculate_forward_masks) ...
-        """Check if actions are valid for given states"""
+        """Check if actions are valid for given states
+
+        Returns:
+            A boolean tensor of shape (batch_size,) indicating validity for each state-action pair.
+            torchgfn's _step method will use .all() on this to check if all actions are valid.
+        """
+        # Extract tensor from Actions object if needed
+        if hasattr(actions, 'tensor'):
+            actions_tensor = actions.tensor
+        else:
+            actions_tensor = actions
+
         if backward:
-            return torch.zeros(len(states), dtype=torch.bool, device=self._device)
+            batch_size = states.batch_shape[0] if states.batch_shape else 1
+            return torch.zeros(batch_size, dtype=torch.bool, device=self._device)
 
-        valid = torch.ones(len(states), dtype=torch.bool, device=self._device)
+        batch_size = states.batch_shape[0] if states.batch_shape else 1
+        valid = torch.ones(batch_size, dtype=torch.bool, device=self._device)
 
-        for i in range(len(states)):
-            state = states.tensor[i]
-            n = int(state.item())
-            action = actions[i].item()
+        for i in range(batch_size):
+            if states.tensor.dim() == 1:
+                state = states.tensor
+                action = actions_tensor.item() if actions_tensor.dim() == 0 else actions_tensor[0].item()
+            else:
+                state = states.tensor[i]
+                action = actions_tensor[i].item()
 
+            n = int(state[0].item())
+
+            # Terminal states have no valid actions
             if n >= self.max_nodes:
                 valid[i] = False
                 continue
 
-            if action >= 0:
+            # Check if action is in valid range
+            if action >= self.n_actions:
+                valid[i] = False
+                continue
+
+            # For connection decisions, check if node_idx is valid
+            if action < self.n_actions - 1:
                 node_idx = action // 2
                 if node_idx >= n:
                     valid[i] = False
 
-        return valid
+        # Return .all() as a scalar boolean if being used in control flow
+        # This is what torchgfn's _step expects
+        return valid.all()
 
     def backward_step(self, states: States, actions: torch.Tensor) -> States:
         """Backward sampling not implemented for causal sets"""
         raise NotImplementedError("Backward sampling not supported")
 
-
     def get_log_reward(self, final_states: States) -> torch.Tensor:
         """
         Compute log reward (negative energy) for final states.
         """
+        batch_size = final_states.batch_shape[0] if final_states.batch_shape else 1
         rewards = []
 
-        for i in range(len(final_states)):
-            state = final_states.tensor[i]
+        for i in range(batch_size):
+            if final_states.tensor.dim() == 1:
+                state = final_states.tensor
+            else:
+                state = final_states.tensor[i]
+
             n = int(state[0].item())
 
             if n != self.max_nodes:

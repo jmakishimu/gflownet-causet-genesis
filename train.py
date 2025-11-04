@@ -15,7 +15,6 @@ import time
 import math
 
 from gfn.gflownet.trajectory_balance import TBGFlowNet
-# from gfn.estimators import NeuralNetEstimator # This import was removed previously
 from gfn.estimators import DiscretePolicyEstimator
 from gfn.samplers import Sampler
 
@@ -24,10 +23,9 @@ from causet_reward import CausalSetRewardProxy
 
 
 class CausetPolicyNetwork(nn.Module):
-    # ... (CausetPolicyNetwork class is correct as previously provided) ...
     def __init__(self, state_dim: int, hidden_dim: int, action_dim: int):
         super().__init__()
-        self.input_dim = state_dim # Added attribute
+        self.input_dim = state_dim
 
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -50,7 +48,6 @@ class CausetPolicyNetwork(nn.Module):
 
 
 class CausetPolicyEstimator(DiscretePolicyEstimator):
-    # ... (CausetPolicyEstimator class is correct as previously provided) ...
     def __init__(self, env: CausalSetEnv, hidden_dim: int = 256,
                  temperature: float = 1.0, epsilon: float = 0.1):
 
@@ -61,12 +58,12 @@ class CausetPolicyEstimator(DiscretePolicyEstimator):
         module = CausetPolicyNetwork(
             state_dim=env.state_dim,
             hidden_dim=hidden_dim,
-            action_dim=env.max_nodes * 2 + 1
+            action_dim=env.n_actions
         )
 
         super().__init__(
             module=module,
-            n_actions=env.max_nodes * 2 + 1,
+            n_actions=env.n_actions,
             preprocessor=None,
             is_backward=False
         )
@@ -83,7 +80,6 @@ class CausetPolicyEstimator(DiscretePolicyEstimator):
 
 
 def parse_args():
-    # ... (parse_args function is correct as previously provided) ...
     parser = argparse.ArgumentParser()
     parser.add_argument("--N", type=int, default=10,
                        help="Max causet size (start smaller for debugging)")
@@ -147,10 +143,14 @@ def main():
     print(f"Reward type: {args.reward_type}")
 
     log_data = []
-    pbar = tqdm(range(args.num_steps))
+    # Temporarily disable tqdm for debugging
+    # pbar = tqdm(range(args.num_steps))
     start_time = time.time()
 
-    for step in pbar:
+    for step in range(args.num_steps):  # Direct range instead of tqdm
+        if step % 100 == 0:
+            print(f"\n--- Step {step} ---")
+
         try:
             # Anneal exploration parameters
             progress = min(step / args.epsilon_decay_steps, 1.0)
@@ -167,18 +167,16 @@ def main():
             pf.train()
             optimizer.zero_grad()
 
-            # Sample trajectories
-            # FIX: Change n_trajectories to positional argument n based on traceback
-            trajectories = gflownet.sample_trajectories(
+            # Sample trajectories using the Sampler
+            sampler = Sampler(estimator=pf)
+            trajectories = sampler.sample_trajectories(
                 env=env,
-                n=args.batch_size,
-                save_logprobs=True,
-                save_estimator_outputs=True
+                n=args.batch_size  # Use 'n' not 'n_trajectories'
             )
 
             # Calculate loss
             loss = gflownet.loss(env, trajectories)
-            # ... (rest of the logging and training loop is correct) ...
+
             if not loss.isfinite():
                 print(f"\nWarning: Non-finite loss at step {step}")
                 continue
@@ -190,17 +188,41 @@ def main():
 
             # Logging
             if step % 100 == 0 or step == args.num_steps - 1:
-                terminating_states_tensor = trajectories.states.tensor[
-                    trajectories.when_is_done
-                ]
+                # Get terminating states from trajectories
+
+                # trajectories.states is a States object with all states in all trajectories
+                # We need to identify which are terminal (have reached max_nodes)
+                all_states_tensor = trajectories.states.tensor
+
+                # all_states_tensor shape: (total_states, state_dim) or (batch, total_states, state_dim)
+                # Let's flatten and check each state
+                if all_states_tensor.dim() == 3:
+                    # Shape is (n_steps, batch_size, state_dim)
+                    batch_size = all_states_tensor.shape[1]
+                    # Get the last non-sink state for each trajectory
+                    terminating_states_list = []
+                    for b in range(batch_size):
+                        # Get all states for this trajectory
+                        traj_states = all_states_tensor[:, b, :]
+                        # Find last non-sink state (where first element != -1)
+                        non_sink_mask = traj_states[:, 0] != -1
+                        if non_sink_mask.any():
+                            last_idx = non_sink_mask.nonzero(as_tuple=True)[0][-1]
+                            terminating_states_list.append(traj_states[last_idx])
+                        else:
+                            terminating_states_list.append(traj_states[-1])
+                    terminating_states_tensor = torch.stack(terminating_states_list)
+                else:
+                    # Simpler case: just use all states
+                    terminating_states_tensor = all_states_tensor
 
                 energies_list = []
                 rewards_list = []
                 valid_count = 0
 
-                for i in range(len(terminating_states_tensor)):
+                for i in range(terminating_states_tensor.shape[0]):
                     state = terminating_states_tensor[i]
-                    n = int(state.item())
+                    n = int(state[0].item())
 
                     if n == args.N:
                         g = env._state_to_graph(state)
@@ -215,9 +237,9 @@ def main():
                 avg_reward = np.mean(rewards_list) if rewards_list else 0.0
 
                 unique_graphs = set()
-                for i in range(len(terminating_states_tensor)):
+                for i in range(terminating_states_tensor.shape[0]):
                     state = terminating_states_tensor[i]
-                    n = int(state.item())
+                    n = int(state[0].item())
                     if n == args.N:
                         edges = tuple(state[1:].cpu().numpy())
                         unique_graphs.add(edges)
@@ -235,17 +257,15 @@ def main():
                     'elapsed_time_sec': time.time() - start_time
                 })
 
-                pbar.set_postfix(
-                    loss=loss.item(),
-                    avg_e=avg_energy,
-                    avg_r=avg_reward,
-                    diversity=diversity,
-                    valid_p=valid_count/args.batch_size
-                )
+                print(f"Step {step}: loss={loss.item():.2e}, avg_e={avg_energy:.2e}, "
+                      f"avg_r={avg_reward:.4f}, diversity={diversity:.3f}, valid={valid_count}/{args.batch_size}")
 
         except Exception as e:
             print(f"\nError during step {step}: {e}")
-            break
+            import traceback
+            traceback.print_exc()
+            # Don't break - let's see all errors
+            continue
 
     print("\nTraining finished.")
     df = pd.DataFrame(log_data)
