@@ -1,6 +1,14 @@
 #
 # gflownet-causet-genesis/train.py
 #
+# --- THIS FILE IS CORRECTED ---
+#
+# Fixes applied:
+# 1. Simplified CausetPolicyEstimator (no overrides).
+# 2. Passed annealed 'current_temp' and 'current_epsilon'
+#    directly into sampler.sample_trajectories() as
+#    keyword arguments, which the base class handles.
+#
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -48,12 +56,9 @@ class CausetPolicyNetwork(nn.Module):
 
 
 class CausetPolicyEstimator(DiscretePolicyEstimator):
-    def __init__(self, env: CausalSetEnv, hidden_dim: int = 256,
-                 temperature: float = 1.0, epsilon: float = 0.1):
+    def __init__(self, env: CausalSetEnv, hidden_dim: int = 256):
 
         self.env = env
-        self.temperature = temperature
-        self.epsilon = epsilon
 
         module = CausetPolicyNetwork(
             state_dim=env.state_dim,
@@ -61,6 +66,7 @@ class CausetPolicyEstimator(DiscretePolicyEstimator):
             action_dim=env.n_actions
         )
 
+        # Use the base class __init__
         super().__init__(
             module=module,
             n_actions=env.n_actions,
@@ -70,14 +76,7 @@ class CausetPolicyEstimator(DiscretePolicyEstimator):
 
         self.to(env.device)
 
-    def set_epsilon(self, epsilon: float):
-        """Update exploration rate"""
-        self.epsilon = epsilon
-
-    def set_temperature(self, temperature: float):
-        """Update temperature"""
-        self.temperature = temperature
-
+    # No overrides are needed. The base class methods will be used.
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -119,15 +118,15 @@ def main():
     print(f"Using device: {args.device}")
 
     print("Initializing environment and reward proxy...")
+    # Use the corrected causet_env.py
     proxy = CausalSetRewardProxy(reward_type=args.reward_type)
     env = CausalSetEnv(max_nodes=args.N, proxy=proxy, device=args.device)
 
     print("Initializing policy network...")
+    # Initialize the simplified estimator
     pf = CausetPolicyEstimator(
         env=env,
-        hidden_dim=args.hidden_dim,
-        temperature=args.temp_start,
-        epsilon=args.epsilon_start
+        hidden_dim=args.hidden_dim
     )
 
     pb = pf
@@ -143,9 +142,10 @@ def main():
     print(f"Reward type: {args.reward_type}")
 
     log_data = []
-    # Temporarily disable tqdm for debugging
-    # pbar = tqdm(range(args.num_steps))
     start_time = time.time()
+
+    # Create sampler *once* outside the loop
+    sampler = Sampler(estimator=pf)
 
     for step in range(args.num_steps):  # Direct range instead of tqdm
         if step % 100 == 0:
@@ -156,25 +156,26 @@ def main():
             progress = min(step / args.epsilon_decay_steps, 1.0)
             current_epsilon = args.epsilon_start + \
                             (args.epsilon_end - args.epsilon_start) * progress
-            pf.set_epsilon(current_epsilon)
 
             progress_temp = min(step / args.temp_decay_steps, 1.0)
             current_temp = args.temp_start + \
                           (args.temp_end - args.temp_start) * progress_temp
-            pf.set_temperature(current_temp)
 
             # Training step
             pf.train()
             optimizer.zero_grad()
 
-            # Sample trajectories using the Sampler
-            sampler = Sampler(estimator=pf)
+            # Pass annealed values as keyword arguments
+            # The base DiscretePolicyEstimator handles these.
             trajectories = sampler.sample_trajectories(
                 env=env,
-                n=args.batch_size  # Use 'n' not 'n_trajectories'
+                n=args.batch_size,
+                temperature=current_temp,
+                epsilon=current_epsilon
             )
 
             # Calculate loss
+            # With the corrected causet_env.py, this should work
             loss = gflownet.loss(env, trajectories)
 
             if not loss.isfinite():
@@ -188,33 +189,27 @@ def main():
 
             # Logging
             if step % 100 == 0 or step == args.num_steps - 1:
-                # Get terminating states from trajectories
-
-                # trajectories.states is a States object with all states in all trajectories
-                # We need to identify which are terminal (have reached max_nodes)
                 all_states_tensor = trajectories.states.tensor
 
-                # all_states_tensor shape: (total_states, state_dim) or (batch, total_states, state_dim)
-                # Let's flatten and check each state
                 if all_states_tensor.dim() == 3:
-                    # Shape is (n_steps, batch_size, state_dim)
                     batch_size = all_states_tensor.shape[1]
-                    # Get the last non-sink state for each trajectory
                     terminating_states_list = []
+
+                    is_sink = trajectories.next_states.is_sink_state
+
                     for b in range(batch_size):
-                        # Get all states for this trajectory
-                        traj_states = all_states_tensor[:, b, :]
-                        # Find last non-sink state (where first element != -1)
-                        non_sink_mask = traj_states[:, 0] != -1
-                        if non_sink_mask.any():
-                            last_idx = non_sink_mask.nonzero(as_tuple=True)[0][-1]
-                            terminating_states_list.append(traj_states[last_idx])
-                        else:
-                            terminating_states_list.append(traj_states[-1])
+                        sink_idx = is_sink[:, b].nonzero(as_tuple=True)[0]
+                        if len(sink_idx) > 0:
+                            last_idx = sink_idx[0]
+                            terminating_states_list.append(all_states_tensor[last_idx, b, :])
+
+                    if not terminating_states_list:
+                        print("Warning: No valid terminating states found in batch.")
+                        continue
+
                     terminating_states_tensor = torch.stack(terminating_states_list)
                 else:
-                    # Simpler case: just use all states
-                    terminating_states_tensor = all_states_tensor
+                    terminating_states_tensor = all_states_tensor[trajectories.is_terminal]
 
                 energies_list = []
                 rewards_list = []
@@ -258,13 +253,12 @@ def main():
                 })
 
                 print(f"Step {step}: loss={loss.item():.2e}, avg_e={avg_energy:.2e}, "
-                      f"avg_r={avg_reward:.4f}, diversity={diversity:.3f}, valid={valid_count}/{args.batch_size}")
+                      f"avg_r={avg_reward:.4f}, diversity={diversity:.3f}, valid={valid_count}/{terminating_states_tensor.shape[0]}")
 
         except Exception as e:
             print(f"\nError during step {step}: {e}")
             import traceback
             traceback.print_exc()
-            # Don't break - let's see all errors
             continue
 
     print("\nTraining finished.")

@@ -1,6 +1,15 @@
 #
 # gflownet-causet-genesis/causet_env.py
 #
+# --- THIS FILE IS CORRECTED ---
+#
+# Fixes applied:
+# 1. Decoupled GFlowNet 'exit_action' from the environment's 'add-node' action.
+# 2. 'is_action_valid' returns valid.all().
+# 3. Implemented _calculate_backward_masks.
+# 4. CRITICAL FIX: _calculate_forward_masks and is_action_valid
+#    now handle the sink state (n < 0) to prevent -inf logprobs.
+#
 import torch
 import networkx as nx
 import numpy as np
@@ -17,14 +26,17 @@ class CausalSetEnv(Env):
         self.max_edges = (max_nodes * (max_nodes - 1)) // 2
         self.state_dim = 1 + self.max_edges
 
-        # Action space: for each existing node, we can decide to connect (2 choices)
-        # Plus one exit action
-        self.n_actions = max_nodes * 2 + 1
+        # Action space:
+        # 0 ... (max_nodes * 2 - 1): Connection decisions
+        # (max_nodes * 2) or (self.n_actions - 2): "Add-node" action
+        # (max_nodes * 2 + 1) or (self.n_actions - 1): GFlowNet "exit_action"
+        self.n_actions = max_nodes * 2 + 2
 
         s0_tensor = torch.zeros((self.state_dim,), dtype=torch.float, device=self._device)
         sf_tensor = torch.full((self.state_dim,), -1.0, dtype=torch.float, device=self._device)
 
         dummy_action_tensor = torch.tensor([self.n_actions], dtype=torch.long, device=self._device)
+        # The true GFlowNet exit action is the LAST action
         exit_action_tensor = torch.tensor([self.n_actions - 1], dtype=torch.long, device=self._device)
 
         super().__init__(
@@ -33,7 +45,7 @@ class CausalSetEnv(Env):
             state_shape=(self.state_dim,),
             action_shape=(1,),
             dummy_action=dummy_action_tensor,
-            exit_action=exit_action_tensor,
+            exit_action=exit_action_tensor, # Pass the correct exit action
         )
 
         self.preprocessor = None
@@ -101,11 +113,7 @@ class CausalSetEnv(Env):
         This is required by torchgfn for discrete environments.
         """
         states.forward_masks = self._calculate_forward_masks(states)
-        states.backward_masks = torch.zeros(
-            (states.batch_shape[0] if states.batch_shape else 1, self.n_actions - 1),
-            dtype=torch.bool,
-            device=self._device
-        )
+        states.backward_masks = self._calculate_backward_masks(states)
 
     def _calculate_forward_masks(self, states: States) -> torch.Tensor:
         """Computes a boolean mask of valid forward actions for a batch of states."""
@@ -115,6 +123,7 @@ class CausalSetEnv(Env):
         else:
             batch_size = 1
 
+        # Use new action space size
         masks = torch.zeros((batch_size, self.n_actions), dtype=torch.bool, device=self._device)
 
         for i in range(batch_size):
@@ -126,24 +135,72 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            # If we've reached max nodes, no actions valid (terminal state)
+            # --- THIS IS THE FIX ---
+            # Handle sink state (n < 0)
+            if n < 0:
+                # This is the sink state s_f.
+                # The TB loss will call pb.log_prob(s_f, exit_action).
+                # To prevent -inf, we must set the mask for exit_action to True.
+                masks[i, self.n_actions - 1] = True
+                continue
+            # --- END FIX ---
+
+            # If we've reached max nodes, ONLY the GFN exit action is valid
             if n >= self.max_nodes:
+                masks[i, self.n_actions - 1] = True  # GFN exit action
                 continue
 
-            # When n=0, we can only add the first node (exit action only)
+            # When n=0, we can only add the first node
             if n == 0:
-                masks[i, self.n_actions - 1] = True  # Exit action to add first node
+                masks[i, self.n_actions - 2] = True  # "Add-node" action
                 continue
 
             # For n > 0, we have connection decisions for existing nodes
-            # Actions 0 to (n*2 - 1) are connection decisions for existing nodes
-            # Each node i in [0, n-1] has two actions: i*2 (no connect) and i*2+1 (connect)
             for node_idx in range(n):
                 masks[i, node_idx * 2] = True      # Decision: don't connect
                 masks[i, node_idx * 2 + 1] = True  # Decision: connect
 
-            # Exit action is always valid to add next node
-            masks[i, self.n_actions - 1] = True
+            # The "add-node" action is always valid (until n = max_nodes)
+            masks[i, self.n_actions - 2] = True
+
+        return masks
+
+    def _calculate_backward_masks(self, states: States) -> torch.Tensor:
+        """Computes a boolean mask of valid backward actions for a batch of states."""
+        if states.batch_shape:
+            batch_size = states.batch_shape[0]
+        else:
+            batch_size = 1
+
+        # n_actions - 1 because backward_masks don't include the GFN exit action
+        masks = torch.zeros((batch_size, self.n_actions - 1), dtype=torch.bool, device=self._device)
+
+        for i in range(batch_size):
+            if states.tensor.dim() == 1:
+                state = states.tensor
+            else:
+                state = states.tensor[i]
+
+            n = int(state[0].item())
+
+            if n <= 0:
+                # s0 (n=0) or s_f (n=-1) have no parents.
+                continue
+
+            # If n > 0:
+            # Parent 1: state n-1 (via action "add-node")
+            masks[i, self.n_actions - 2] = True # "add-node" action
+
+            # Parent 2: state n with different edges (via connection actions)
+            for node_idx in range(n): # Actions up to n
+                action_no_connect = node_idx * 2
+                action_connect = node_idx * 2 + 1
+
+                if action_no_connect < (self.n_actions - 1):
+                     masks[i, action_no_connect] = True
+
+                if action_connect < (self.n_actions - 1):
+                     masks[i, action_connect] = True
 
         return masks
 
@@ -186,13 +243,6 @@ class CausalSetEnv(Env):
     def step(self, states: States, actions: torch.Tensor) -> States:
         """
         Apply actions to states and return new states with updated masks.
-
-        Action semantics:
-        - When at state with n nodes, we're deciding connections for node n (about to be added)
-        - Action i (for i < n): if action is i*2+1, connect node i to new node n
-        - Exit action (self.n_actions - 1): finalize decisions and add node n
-
-        CRITICAL: We must NOT transition to sink until n == max_nodes
         """
         # Extract tensor from Actions object if needed
         if hasattr(actions, 'tensor'):
@@ -224,30 +274,32 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            # CRITICAL FIX: Only transition to sink if we REACH max_nodes, not if we're AT max_nodes
-            # The terminal condition should be n >= max_nodes AFTER the action
+            # If at or past terminal state, only valid action is GFN-exit
             if n >= self.max_nodes:
-                # Already at terminal state, transition to sink
+                if action == self.n_actions - 1: # GFN exit action
+                    if new_tensor.dim() == 1:
+                        new_tensor = self.sf.clone()
+                    else:
+                        new_tensor[i] = self.sf.clone()
+                # Any other action is invalid, state remains unchanged (but will be masked)
+                continue
+
+            # "Add-node" action: finalize and add new node (increment n)
+            if action == self.n_actions - 2:
+                state[0] = n + 1
+
+            # GFN-exit action (premature): transition to sink
+            elif action == self.n_actions - 1:
                 if new_tensor.dim() == 1:
                     new_tensor = self.sf.clone()
                 else:
                     new_tensor[i] = self.sf.clone()
-                continue
 
-            # Exit action: finalize and add new node (increment n)
-            if action == self.n_actions - 1:
-                state[0] = n + 1
-                # DON'T transition to sink here - let next step handle it if n+1 == max_nodes
             # Connection decision actions
-            elif action < self.n_actions - 1 and n > 0:
-                # When n > 0, we're deciding connections to node n
+            elif action < self.n_actions - 2 and n > 0:
                 node_idx = action // 2
                 decision = action % 2
-
-                # Only process if node_idx is valid and decision is to connect
                 if node_idx < n and decision == 1:
-                    # Add edge from node_idx to the new node n
-                    # But we haven't incremented n yet, so the edge is for when n increments
                     edge_idx = self._get_edge_index(node_idx, n) + 1
                     if edge_idx < len(state):
                         state[edge_idx] = 1.0
@@ -259,11 +311,8 @@ class CausalSetEnv(Env):
 
     def is_action_valid(self, states: States, actions: torch.Tensor,
                        backward: bool = False) -> torch.Tensor:
-        """Check if actions are valid for given states
-
-        Returns:
-            A boolean tensor of shape (batch_size,) indicating validity for each state-action pair.
-            torchgfn's _step method will use .all() on this to check if all actions are valid.
+        """
+        Check if actions are valid for given states
         """
         # Extract tensor from Actions object if needed
         if hasattr(actions, 'tensor'):
@@ -272,8 +321,8 @@ class CausalSetEnv(Env):
             actions_tensor = actions
 
         if backward:
-            batch_size = states.batch_shape[0] if states.batch_shape else 1
-            return torch.zeros(batch_size, dtype=torch.bool, device=self._device)
+            # Return a single boolean
+            return torch.tensor(False, device=self._device)
 
         batch_size = states.batch_shape[0] if states.batch_shape else 1
         valid = torch.ones(batch_size, dtype=torch.bool, device=self._device)
@@ -288,24 +337,44 @@ class CausalSetEnv(Env):
 
             n = int(state[0].item())
 
-            # Terminal states have no valid actions
-            if n >= self.max_nodes:
-                valid[i] = False
-                continue
-
-            # Check if action is in valid range
+            # Check if action is out of bounds
             if action >= self.n_actions:
                 valid[i] = False
                 continue
 
-            # For connection decisions, check if node_idx is valid
-            if action < self.n_actions - 1:
+            # --- FIX for sink state ---
+            if n < 0:
+                # s_f state. Only valid action is the exit action
+                valid[i] = (action == self.n_actions - 1)
+                continue
+            # --- END FIX ---
+
+            # If at terminal state, only GFN-exit is valid
+            if n >= self.max_nodes:
+                valid[i] = (action == self.n_actions - 1)
+                continue
+
+            # If n=0, only "add-node" is valid
+            if n == 0:
+                valid[i] = (action == self.n_actions - 2)
+                continue
+
+            # If 0 < n < max_nodes:
+            # GFN-exit action is invalid
+            if action == self.n_actions - 1:
+                valid[i] = False
+            # "Add-node" action is valid
+            elif action == self.n_actions - 2:
+                valid[i] = True
+            # Connection decisions
+            else:
                 node_idx = action // 2
                 if node_idx >= n:
                     valid[i] = False
+                else:
+                    valid[i] = True # Both (connect/no-connect) are valid
 
-        # Return .all() as a scalar boolean if being used in control flow
-        # This is what torchgfn's _step expects
+        # Return .all() as a scalar boolean
         return valid.all()
 
     def backward_step(self, states: States, actions: torch.Tensor) -> States:
