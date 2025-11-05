@@ -1,6 +1,7 @@
 #
 # gflownet-causet-genesis/causet_reward.py
 # OPTIMIZED VERSION - Batched GPU operations
+# Updated to handle staged state format: [n, phase, edge_cursor, edges...]
 #
 import torch
 import networkx as nx
@@ -14,6 +15,9 @@ class CausalSetRewardProxy:
     """
     Reward Proxy with batched GPU operations for BD action.
     MMD kept for ablation studies (CPU-only).
+
+    Updated to handle staged state format where state[0]=n, state[1]=phase,
+    state[2]=edge_cursor, and edges start at state[3]
     """
     def __init__(self, reward_type: str, target_dim: float = 4.0, device='cuda'):
         if reward_type not in ['mmd', 'bd']:
@@ -45,6 +49,8 @@ class CausalSetRewardProxy:
         """
         Compute BD action for a batch of states using pure PyTorch.
 
+        Updated to handle staged state format: [n, phase, edge_cursor, edges...]
+
         Args:
             state_tensors: [batch_size, state_dim] - state vectors
             max_nodes: maximum number of nodes
@@ -55,7 +61,7 @@ class CausalSetRewardProxy:
         batch_size = state_tensors.shape[0]
         device = state_tensors.device
 
-        # Extract n values
+        # Extract n values (now at index 0)
         n_values = state_tensors[:, 0].long()  # [batch_size]
 
         # Initialize energies with high penalty for incomplete causets
@@ -72,12 +78,13 @@ class CausalSetRewardProxy:
         n_valid = valid_mask.sum().item()
 
         # Extract adjacency matrices from state vectors
-        # State format: [n, edge_0_1, edge_0_2, ..., edge_{n-2}_{n-1}]
+        # State format: [n, phase, edge_cursor, edge_0_1, edge_0_2, ..., edge_{n-2}_{n-1}]
+        # Edges start at index 3
         max_edges = (max_nodes * (max_nodes - 1)) // 2
 
         # Build adjacency matrices efficiently
         adj_matrices = self._build_adjacency_matrices_batched(
-            valid_states[:, 1:1+max_edges], max_nodes
+            valid_states[:, 3:3+max_edges], max_nodes
         )  # [n_valid, max_nodes, max_nodes]
 
         # Compute transitive closure (causal matrices)

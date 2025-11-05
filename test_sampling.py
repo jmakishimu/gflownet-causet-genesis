@@ -34,7 +34,7 @@ def test_sampling():
     print("="*60, flush=True)
 
     # Setup
-    N = 5
+    N = 40
     batch_size = 4  # Small batch for testing
 
     print(f"\nSetting up environment (N={N})...", flush=True)

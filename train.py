@@ -1,6 +1,6 @@
 #
 # gflownet-causet-genesis/train.py
-# OPTIMIZED VERSION - Fixed warnings, faster training
+# STAGED CONSTRUCTION VERSION - Uses SubTB (no backward policy needed)
 #
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ import os
 from tqdm import tqdm
 import time
 
-from gfn.gflownet.trajectory_balance import TBGFlowNet
+from gfn.gflownet.sub_trajectory_balance import SubTBGFlowNet
 from gfn.estimators import DiscretePolicyEstimator
 from gfn.samplers import Sampler
 
@@ -86,7 +86,7 @@ def parse_args():
 
     # Exploration
     parser.add_argument("--epsilon_start", type=float, default=0.3)
-    parser.add_argument("--epsilon_end", type=float, default=0.05)
+    parser.add_argument("--epsilon_end", type=float, default=0.0)
     parser.add_argument("--epsilon_decay_steps", type=int, default=5000)
     parser.add_argument("--temp_start", type=float, default=2.0)
     parser.add_argument("--temp_end", type=float, default=1.0)
@@ -109,12 +109,13 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
 
     print("="*70)
-    print("OPTIMIZED CAUSET GFLOWNET TRAINING")
+    print("STAGED CAUSET GFLOWNET TRAINING (SubTB)")
     print("="*70)
     print(f"Run: {args.run_name}")
     print(f"Device: {args.device}")
     print(f"N: {args.N}, Batch: {args.batch_size}, Steps: {args.num_steps}")
     print(f"AMP: {args.use_amp}")
+    print(f"Loss: SubTrajectory Balance (no backward policy needed)")
     print("="*70 + "\n")
 
     # Initialize environment
@@ -124,19 +125,12 @@ def main():
 
     print(f"State dim: {env.state_dim}, Action dim: {env.n_actions}")
 
-    # Create optimized policies
-    print("Creating policy networks...")
+    # Create forward policy
+    print("Creating policy network...")
     pf_module = OptimizedCausetPolicy(
         state_dim=env.state_dim,
         hidden_dim=args.hidden_dim,
         action_dim=env.n_actions,
-        n_layers=args.n_layers
-    )
-
-    pb_module = OptimizedCausetPolicy(
-        state_dim=env.state_dim,
-        hidden_dim=args.hidden_dim,
-        action_dim=env.n_actions - 1,
         n_layers=args.n_layers
     )
 
@@ -147,28 +141,60 @@ def main():
         is_backward=False
     )
 
-    pb = DiscretePolicyEstimator(
-        module=pb_module,
-        n_actions=env.n_actions,
-        preprocessor=None,
-        is_backward=True
+    pf.to(args.device)
+
+    # Since we're using constant_pb=True, just pass None for pb
+    # SubTB will handle this correctly
+    pb = None
+
+    # Create log flow estimator (required by SubTB)
+    from gfn.estimators import ScalarEstimator
+
+    class LogFlowModule(nn.Module):
+        """MLP for estimating log state flows"""
+        def __init__(self, state_dim: int, hidden_dim: int):
+            super().__init__()
+            self.input_dim = state_dim  # Required by ScalarEstimator
+            self.network = nn.Sequential(
+                nn.Linear(state_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.network(x)
+
+    logF_module = LogFlowModule(env.state_dim, args.hidden_dim)
+
+    logF = ScalarEstimator(
+        module=logF_module,
+        preprocessor=None
     )
 
-    pf.to(args.device)
-    pb.to(args.device)
+    logF.to(args.device)
 
     n_params_pf = sum(p.numel() for p in pf.parameters())
-    n_params_pb = sum(p.numel() for p in pb.parameters())
+    n_params_logF = sum(p.numel() for p in logF.parameters())
     print(f"PF parameters: {n_params_pf:,}")
-    print(f"PB parameters: {n_params_pb:,}")
-    print(f"Total: {n_params_pf + n_params_pb:,}\n")
+    print(f"LogF parameters: {n_params_logF:,}")
+    print(f"Total: {n_params_pf + n_params_logF:,}\n")
 
-    # Initialize GFlowNet
-    gflownet = TBGFlowNet(pf=pf, pb=pb)
+    # Initialize GFlowNet with SubTB
+    print("Initializing SubTB GFlowNet...")
+    gflownet = SubTBGFlowNet(
+        pf=pf,
+        pb=None,  # No backward policy for staged construction
+        logF=logF,
+        weighting="geometric_within",
+        lamda=0.9,
+        constant_pb=True  # Backward policy is constant (uniform)
+    )
 
-    # Optimizer with weight decay
+    # Optimizer with weight decay (include logF parameters)
     optimizer = optim.AdamW(
-        list(pf.parameters()) + list(pb.parameters()),
+        list(pf.parameters()) + list(logF.parameters()),
         lr=args.lr,
         weight_decay=1e-4
     )
@@ -178,7 +204,7 @@ def main():
         optimizer, T_max=args.num_steps, eta_min=args.lr * 0.1
     )
 
-    # FIXED: Use torch.amp instead of torch.cuda.amp
+    # AMP scaler
     scaler = torch.amp.GradScaler('cuda') if args.use_amp and args.device == 'cuda' else None
 
     # Create sampler
@@ -201,19 +227,19 @@ def main():
 
         # Training step
         pf.train()
-        pb.train()
+        logF.train()
         optimizer.zero_grad()
 
-        # FIXED: Use torch.amp.autocast instead of torch.cuda.amp.autocast
-        with torch.amp.autocast('cuda', enabled=args.use_amp and args.device == 'cuda'):
-            trajectories = sampler.sample_trajectories(
-                env=env,
-                n=args.batch_size,
-                temperature=current_temp,
-                epsilon=current_epsilon
-            )
+        # Don't use AMP with SubTB due to dtype issues in state flow calculations
+        # The loss computation involves complex indexing that doesn't work well with mixed precision
+        trajectories = sampler.sample_trajectories(
+            env=env,
+            n=args.batch_size,
+            temperature=current_temp,
+            epsilon=current_epsilon
+        )
 
-            loss = gflownet.loss(env, trajectories)
+        loss = gflownet.loss(env, trajectories)
 
         if not loss.isfinite():
             pbar.write(f"Warning: Non-finite loss at step {step}")
@@ -223,23 +249,27 @@ def main():
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(pf.parameters(), args.grad_clip)
-            torch.nn.utils.clip_grad_norm_(pb.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                list(pf.parameters()) + list(logF.parameters()),
+                args.grad_clip
+            )
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(pf.parameters(), args.grad_clip)
-            torch.nn.utils.clip_grad_norm_(pb.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                list(pf.parameters()) + list(logF.parameters()),
+                args.grad_clip
+            )
             optimizer.step()
             scheduler.step()
-
 
         # Update progress bar
         pbar.set_postfix({
             'loss': f'{loss.item():.2e}',
-            'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+            'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+            'eps': f'{current_epsilon:.3f}'
         })
 
         # OPTIMIZED EVALUATION
@@ -262,14 +292,14 @@ def main():
                         # Stack all final states
                         final_states_batch = torch.stack(final_states_list)
 
-                        # BATCHED energy computation (MUCH FASTER)
+                        # BATCHED energy computation
                         if args.reward_type == 'bd':
                             energies = proxy.get_bd_energy_batched(
                                 final_states_batch,
                                 args.N
                             ).cpu().numpy()
                         else:
-                            # Sequential for MMD (ablation)
+                            # Sequential for MMD
                             energies = []
                             for state in final_states_batch:
                                 g = env._state_to_graph(state)
@@ -282,10 +312,15 @@ def main():
                         avg_energy = np.mean(valid_energies) if len(valid_energies) > 0 else 1e9
                         avg_log_reward = -args.beta * avg_energy if len(valid_energies) > 0 else -1e9
                         valid_frac = len(valid_energies) / batch_size_actual
+
+                        # Calculate diversity
+                        unique_graphs = len(set(tuple(s.cpu().numpy()) for s in final_states_batch))
+                        diversity = unique_graphs / len(final_states_batch)
                     else:
                         avg_energy = 1e9
                         avg_log_reward = -1e9
                         valid_frac = 0.0
+                        diversity = 0.0
 
                     log_data.append({
                         'step': step,
@@ -293,6 +328,7 @@ def main():
                         'avg_energy': avg_energy,
                         'avg_log_reward': avg_log_reward,
                         'valid_fraction': valid_frac,
+                        'diversity': diversity,
                         'epsilon': current_epsilon,
                         'temperature': current_temp,
                         'lr': scheduler.get_last_lr()[0],
@@ -303,7 +339,7 @@ def main():
                         pbar.write(
                             f"Step {step}: loss={loss.item():.2e}, "
                             f"E={avg_energy:.2e}, logR={avg_log_reward:.2f}, "
-                            f"valid={valid_frac:.2%}"
+                            f"valid={valid_frac:.2%}, div={diversity:.2%}"
                         )
 
     pbar.close()
@@ -315,7 +351,7 @@ def main():
 
     torch.save({
         'pf': pf.state_dict(),
-        'pb': pb.state_dict(),
+        'logF': logF.state_dict(),
         'optimizer': optimizer.state_dict(),
         'args': vars(args)
     }, os.path.join(run_dir, "checkpoint.pt"))
@@ -332,7 +368,7 @@ def main():
                 env=env,
                 n=args.batch_size,
                 temperature=1.0,
-                epsilon=0.0
+                epsilon=0.0  # Pure exploitation now works!
             )
 
             all_states = trajectories.states.tensor
