@@ -419,8 +419,8 @@ class CausalSetEnv(Env):
                 final_states.tensor,
                 self.max_nodes
             )
-            # Log reward = -energy (lower energy = higher reward)
-            return -energies
+            # Log reward = energy (lower energy = higher reward)
+            return energies
         else:
             # Fallback to sequential (for MMD ablation or old proxy)
             rewards = []
@@ -437,7 +437,7 @@ class CausalSetEnv(Env):
                 else:
                     g = self._state_to_graph(state)
                     energy = self.proxy.get_energy(g)
-                    rewards.append(-energy)
+                    rewards.append(energy)
 
             return torch.tensor(rewards, dtype=torch.float, device=self._device)
 
