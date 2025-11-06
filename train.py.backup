@@ -118,15 +118,15 @@ class LogFlowModule(nn.Module):
         return self.network(x)
 
 
-def get_adaptive_beta(step: int, max_steps: int,
-                             start: float = 0.1, end: float = 1.0) -> float:
+def get_adaptive_beta(step: int, max_steps: int, start: float = 0.1, end: float = 0.1) -> float:
     """
-    Linear beta schedule: β increases at constant rate
-    Most stable for learning
+    Adaptive beta schedule: start small, increase over training
+    Early: explore broadly with weak penalty
+    Late: focus on minimization with strong penalty
     """
     progress = min(step / max_steps, 1.0)
-    return start + (end - start) * progress
-
+    # Exponential schedule for smoother transition
+    return start * (end / start) ** progress
 
 
 def get_curriculum_N(step: int, max_steps: int, start_N: int = 5, target_N: int = 10) -> int:
@@ -164,7 +164,7 @@ def parse_args():
 
     # Adaptive beta schedule
     parser.add_argument("--beta_start", type=float, default=0.1)
-    parser.add_argument("--beta_end", type=float, default=1)
+    parser.add_argument("--beta_end", type=float, default=0.1)
 
     # Training
     parser.add_argument("--num_steps", type=int, default=20_000)
@@ -286,13 +286,12 @@ def main():
 
     # Learning rate scheduler with warmup
     def lr_lambda(step):
-        warmup_steps = min(1000, args.num_steps // 10)  # FIX: adaptive warmup
-
+        warmup_steps = 1000
         if step < warmup_steps:
-            return step / max(warmup_steps, 1)
+            return step / warmup_steps
         else:
             # Cosine decay after warmup
-            progress = (step - warmup_steps) / max(args.num_steps - warmup_steps, 1)  # FIX
+            progress = (step - warmup_steps) / (args.num_steps - warmup_steps)
             return 0.1 + 0.9 * (1 + np.cos(np.pi * progress)) / 2
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

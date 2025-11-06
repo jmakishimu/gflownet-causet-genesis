@@ -1,6 +1,6 @@
 #
 # gflownet-causet-genesis/causet_env.py
-# STAGED CONSTRUCTION VERSION - Improved reward shaping
+# FIXED VERSION - Corrected reward shaping
 #
 import torch
 import networkx as nx
@@ -9,15 +9,13 @@ from typing import Tuple
 from gfn.env import Env
 from gfn.states import States
 
-print("✓ Loading STAGED causet_env.py with IMPROVED REWARD SHAPING")
+print("✓ Loading FIXED causet_env.py with CORRECTED REWARD SHAPING")
 
 class CausalSetEnv(Env):
     """
-    Staged Construction Environment with adaptive reward shaping.
+    Staged Construction Environment with FIXED reward shaping.
 
-    Reward improvements:
-    - Quadratic penalty for distance from S_BD = 0
-    - Adaptive beta schedule (set externally via proxy.beta)
+    Key fix: Reward is now exp(-beta * S_BD^2), creating proper basin at S_BD=0
     """
     def __init__(self, max_nodes: int, proxy, device='cpu'):
         self.max_nodes = max_nodes
@@ -46,7 +44,7 @@ class CausalSetEnv(Env):
         self.States = self.make_States_class()
 
         if hasattr(proxy, 'get_bd_energy_batched'):
-            print(f"✓ Environment using BATCHED GPU rewards with ADAPTIVE SHAPING")
+            print(f"✓ Environment using BATCHED GPU rewards with FIXED SHAPING")
         else:
             print(f"⚠ WARNING: Proxy missing batched rewards - will be slow!")
 
@@ -305,10 +303,13 @@ class CausalSetEnv(Env):
 
     def get_log_reward(self, final_states: States) -> torch.Tensor:
         """
-        IMPROVED REWARD SHAPING:
-        - Quadratic penalty: log(R) = -β * S_BD²
-        - Adaptive beta (accessed via proxy.beta)
-        - Strongly penalizes deviation from S_BD = 0
+        FIXED REWARD SHAPING:
+        log(R) = -beta * S_BD^2
+
+        This creates a proper attractive basin at S_BD=0:
+        - Maximum reward at S_BD=0: log(R)=0, R=1
+        - Decreasing reward as |S_BD| increases
+        - Symmetric penalty for positive/negative deviations
         """
         batch_size = final_states.batch_shape[0] if final_states.batch_shape else 1
 
@@ -320,9 +321,15 @@ class CausalSetEnv(Env):
                 final_states.tensor,
                 self.max_nodes
             )
-            # IMPROVED: Quadratic penalty centered at S_BD = 0
-            # This creates strong gradient signal for minimization
-            log_rewards = beta * torch.square(energies)
+            # FIXED: Negative quadratic centered at S_BD=0
+            # log(R) = -beta * S_BD^2
+            # At S_BD=0: log(R)=0, R=1 (maximum)
+            # As |S_BD| increases: log(R) becomes more negative, R decreases
+            log_rewards = -beta * torch.abs(energies)
+
+            # Clamp to prevent numerical issues
+            log_rewards = torch.clamp(log_rewards, min=-50.0, max=0.0)
+
             return log_rewards
         else:
             rewards = []
@@ -335,12 +342,13 @@ class CausalSetEnv(Env):
                 n = int(state[0].item())
 
                 if n != self.max_nodes:
-                    rewards.append(-1e10)
+                    rewards.append(-50.0)  # Large penalty for incomplete
                 else:
                     g = self._state_to_graph(state)
                     energy = self.proxy.get_energy(g)
-                    # IMPROVED: Same quadratic penalty
-                    rewards.append(-beta * energy * energy)
+                    # Same fix: -beta * S_BD^2
+                    log_r = -beta * torch.abs(energy)
+                    rewards.append(max(log_r, -50.0))
 
             return torch.tensor(rewards, dtype=torch.float, device=self._device)
 
